@@ -22,7 +22,7 @@ import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommand } from "../commands/agent.js";
 import { getHealthSnapshot, type HealthSummary } from "../commands/health.js";
 import { getStatusSummary } from "../commands/status.js";
-import { type ClawdisConfig, loadConfig } from "../config/config.js";
+import { type ClawdisConfig, isNixMode, loadConfig } from "../config/config.js";
 import {
   loadSessionStore,
   resolveStorePath,
@@ -602,10 +602,36 @@ export async function startGatewayServer(
     },
   });
 
+  /**
+   * Load telegram token with priority: env var > tokenFile > botToken
+   * tokenFile allows integration with secret managers like agenix
+   */
+  const loadTelegramToken = (cfg: ClawdisConfig): string => {
+    // Environment variable takes precedence
+    if (process.env.TELEGRAM_BOT_TOKEN) {
+      return process.env.TELEGRAM_BOT_TOKEN.trim();
+    }
+    // Check for file-based token (for secret managers like agenix)
+    if (cfg.telegram?.tokenFile) {
+      const filePath = cfg.telegram.tokenFile;
+      if (!fs.existsSync(filePath)) {
+        logError(`telegram.tokenFile not found: ${filePath}`);
+        return "";
+      }
+      try {
+        return fs.readFileSync(filePath, "utf-8").trim();
+      } catch (err) {
+        logError(`Failed to read telegram.tokenFile: ${String(err)}`);
+        return "";
+      }
+    }
+    // Fall back to inline botToken
+    return cfg.telegram?.botToken?.trim() ?? "";
+  };
+
   const startProviders = async () => {
     const cfg = loadConfig();
-    const telegramToken =
-      process.env.TELEGRAM_BOT_TOKEN ?? cfg.telegram?.botToken ?? "";
+    const telegramToken = loadTelegramToken(cfg);
 
     if (await webAuthExists()) {
       defaultRuntime.log("gateway: starting WhatsApp Web provider");
@@ -2987,6 +3013,9 @@ export async function startGatewayServer(
     `gateway listening on ws://127.0.0.1:${port} (PID ${process.pid})`,
   );
   defaultRuntime.log(`gateway log file: ${getResolvedLoggerSettings().file}`);
+  if (isNixMode) {
+    defaultRuntime.log("gateway: running in Nix mode (config managed externally)");
+  }
 
   // Start loopback WebChat server (unless disabled via config).
   void ensureWebChatServerFromConfig(opts?.webchatPort)
