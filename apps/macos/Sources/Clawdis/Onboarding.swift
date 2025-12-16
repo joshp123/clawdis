@@ -79,11 +79,17 @@ struct OnboardingView: View {
     private let connectionPageIndex = 1
     private let anthropicAuthPageIndex = 2
     private let permissionsPageIndex = 5
+    private var isNixMode: Bool { ProcessInfo.processInfo.isNixMode }
     private var pageOrder: [Int] {
         if self.state.connectionMode == .remote {
             // Remote setup doesn't need local gateway/CLI/workspace setup pages,
             // and WhatsApp/Telegram setup is optional.
             return [0, 1, 5, 9]
+        }
+        if self.isNixMode {
+            // Nix mode: ALL config is declarative. Only show welcome, permissions (TCC
+            // can't be pre-granted by Nix), and ready page.
+            return [0, 5, 9]
         }
         return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     }

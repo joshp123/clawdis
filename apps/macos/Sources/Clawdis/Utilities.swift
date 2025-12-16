@@ -6,6 +6,10 @@ extension ProcessInfo {
         self.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
     }
 
+    var isNixMode: Bool {
+        self.environment["CLAWDIS_NIX_MODE"] == "1"
+    }
+
     var isRunningTests: Bool {
         // SwiftPM tests load one or more `.xctest` bundles. With Swift Testing, `Bundle.main` is not
         // guaranteed to be the `.xctest` bundle, so check all loaded bundles.
@@ -51,6 +55,8 @@ enum LaunchAgentManager {
     }
 
     static func set(enabled: Bool, bundlePath: String) async {
+        if ProcessInfo.processInfo.isNixMode { return }
+
         if enabled {
             self.writePlist(bundlePath: bundlePath)
             _ = await self.runLaunchctl(["bootout", "gui/\(getuid())/\(launchdLabel)"])
@@ -135,6 +141,11 @@ func age(from date: Date, now: Date = .init()) -> String {
 enum CLIInstaller {
     static func installedLocation() -> String? {
         let fm = FileManager.default
+
+        if let explicit = ProcessInfo.processInfo.environment["CLAWDIS_MAC_HELPER_BIN"],
+           fm.isExecutableFile(atPath: explicit) {
+            return explicit
+        }
 
         for basePath in cliHelperSearchPaths {
             let candidate = URL(fileURLWithPath: basePath).appendingPathComponent("clawdis-mac").path
@@ -373,7 +384,11 @@ enum CommandResolver {
     }
 
     static func clawdisExecutable() -> String? {
-        self.findExecutable(named: self.helperName)
+        if let explicit = ProcessInfo.processInfo.environment["CLAWDIS_GATEWAY_BIN"],
+           FileManager.default.isExecutableFile(atPath: explicit) {
+            return explicit
+        }
+        return self.findExecutable(named: self.helperName)
     }
 
     static func nodeCliPath() -> String? {
