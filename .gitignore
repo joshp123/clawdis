@@ -1,7 +1,7 @@
 node_modules
 .env
 dist
-pnpm-lock.yaml
+# pnpm-lock.yaml - REMOVED: Required for Nix builds (pnpm_10.fetchDeps)
 coverage
 .pnpm-store
 .worktrees/
