@@ -86,7 +86,14 @@ struct OnboardingView: View {
 
     private static let clipboardPoll = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
     private let permissionsPageIndex = 5
-    static func pageOrder(for mode: AppState.ConnectionMode) -> [Int] {
+    private var isNixMode: Bool { ProcessInfo.processInfo.isNixMode }
+
+    static func pageOrder(for mode: AppState.ConnectionMode, nixMode: Bool) -> [Int] {
+        if nixMode {
+            // Nix mode: ALL config is declarative. Only show welcome, permissions (TCC
+            // can't be pre-granted by Nix), and ready page.
+            return [0, 5, 9]
+        }
         switch mode {
         case .remote:
             // Remote setup doesn't need local gateway/CLI/workspace setup pages,
@@ -100,7 +107,7 @@ struct OnboardingView: View {
     }
 
     private var pageOrder: [Int] {
-        Self.pageOrder(for: self.state.connectionMode)
+        Self.pageOrder(for: self.state.connectionMode, nixMode: self.isNixMode)
     }
 
     private var pageCount: Int { self.pageOrder.count }
