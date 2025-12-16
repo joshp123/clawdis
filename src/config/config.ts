@@ -5,6 +5,18 @@ import path from "node:path";
 import JSON5 from "json5";
 import { z } from "zod";
 
+import type { AgentKind } from "../agents/index.js";
+
+/**
+ * Nix mode detection: When CLAWDIS_NIX_MODE=1, the gateway is running under Nix.
+ * In this mode:
+ * - No auto-install flows should be attempted
+ * - Missing dependencies should produce actionable Nix-specific error messages
+ * - Config is managed externally (read-only from Nix perspective)
+ */
+export const isNixMode = process.env.CLAWDIS_NIX_MODE === "1";
+
+export type ReplyMode = "text" | "command";
 export type SessionScope = "per-sender" | "global";
 
 export type SessionConfig = {
@@ -55,6 +67,8 @@ export type CronConfig = {
 
 export type TelegramConfig = {
   botToken?: string;
+  /** Path to file containing bot token (for secret managers like agenix) */
+  tokenFile?: string;
   requireMention?: boolean;
   allowFrom?: Array<string | number>;
   mediaMaxMb?: number;
@@ -187,12 +201,21 @@ export type ClawdisConfig = {
   skills?: Record<string, SkillConfig>;
 };
 
-// New branding path (preferred)
-export const CONFIG_PATH_CLAWDIS = path.join(
-  os.homedir(),
-  ".clawdis",
-  "clawdis.json",
-);
+/**
+ * State directory for mutable data (sessions, logs, caches).
+ * Can be overridden via CLAWDIS_STATE_DIR environment variable.
+ * Default: ~/.clawdis
+ */
+export const STATE_DIR_CLAWDIS =
+  process.env.CLAWDIS_STATE_DIR ?? path.join(os.homedir(), ".clawdis");
+
+/**
+ * Config file path (JSON5).
+ * Can be overridden via CLAWDIS_CONFIG_PATH environment variable.
+ * Default: ~/.clawdis/clawdis.json (or $CLAWDIS_STATE_DIR/clawdis.json)
+ */
+export const CONFIG_PATH_CLAWDIS =
+  process.env.CLAWDIS_CONFIG_PATH ?? path.join(STATE_DIR_CLAWDIS, "clawdis.json");
 
 const ClawdisSchema = z.object({
   identity: z
@@ -309,6 +332,7 @@ const ClawdisSchema = z.object({
   telegram: z
     .object({
       botToken: z.string().optional(),
+      tokenFile: z.string().optional(),
       requireMention: z.boolean().optional(),
       allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
       mediaMaxMb: z.number().positive().optional(),
