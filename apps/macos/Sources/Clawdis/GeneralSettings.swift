@@ -23,20 +23,6 @@ struct GeneralSettings: View {
     var body: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 18) {
-                if self.isNixMode {
-                    HStack(spacing: 8) {
-                        Image(systemName: "gearshape.2.fill")
-                            .foregroundStyle(.secondary)
-                        Text("Managed by Nix")
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 6)
-                    .padding(.horizontal, 10)
-                    .background(Color.gray.opacity(0.12))
-                    .cornerRadius(8)
-                }
-
                 if !self.state.onboardingSeen {
                     Text("Complete onboarding to finish setup")
                         .font(.callout.weight(.semibold))
