@@ -6,6 +6,27 @@ struct DevicePresentation: Sendable {
 }
 
 enum DeviceModelCatalog {
+    private static let resourceBundle: Bundle = {
+        let bundleName = "Clawdis_Clawdis.bundle"
+        let mainBundle = Bundle.main.bundleURL
+        var candidateURLs: [URL] = [
+            mainBundle.appendingPathComponent(bundleName),
+        ]
+        if let resourceURL = Bundle.main.resourceURL {
+            candidateURLs.append(resourceURL.appendingPathComponent(bundleName))
+        } else {
+            candidateURLs.append(
+                mainBundle.appendingPathComponent("Contents/Resources").appendingPathComponent(bundleName))
+        }
+
+        for url in candidateURLs {
+            if let bundle = Bundle(url: url) {
+                return bundle
+            }
+        }
+
+        return Bundle.main
+    }()
     private static let modelIdentifierToName: [String: String] = loadModelIdentifierToName()
 
     static func presentation(deviceFamily: String?, modelIdentifier: String?) -> DevicePresentation? {
@@ -104,7 +125,7 @@ enum DeviceModelCatalog {
     }
 
     private static func loadMapping(resourceName: String) -> [String: String] {
-        guard let url = Bundle.module.url(
+        guard let url = resourceBundle.url(
             forResource: resourceName,
             withExtension: "json",
             subdirectory: "DeviceModels")
