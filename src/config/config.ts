@@ -5,8 +5,6 @@ import path from "node:path";
 import JSON5 from "json5";
 import { z } from "zod";
 
-import type { AgentKind } from "../agents/index.js";
-
 /**
  * Nix mode detection: When CLAWDIS_NIX_MODE=1, the gateway is running under Nix.
  * In this mode:
