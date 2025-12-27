@@ -6,10 +6,79 @@ import AppKit
 import UIKit
 #endif
 
+#if os(macOS)
+extension NSAppearance {
+    fileprivate var isDarkAqua: Bool {
+        self.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    }
+}
+#endif
+
 enum ClawdisChatTheme {
+    #if os(macOS)
+    static func resolvedAssistantBubbleColor(for appearance: NSAppearance) -> NSColor {
+        // NSColor semantic colors don't reliably resolve for arbitrary NSAppearance in SwiftPM.
+        // Use explicit light/dark values so the bubble updates when the system appearance flips.
+        appearance.isDarkAqua
+            ? NSColor(calibratedWhite: 0.18, alpha: 0.88)
+            : NSColor(calibratedWhite: 0.94, alpha: 0.92)
+    }
+
+    static func resolvedOnboardingAssistantBubbleColor(for appearance: NSAppearance) -> NSColor {
+        appearance.isDarkAqua
+            ? NSColor(calibratedWhite: 0.20, alpha: 0.94)
+            : NSColor(calibratedWhite: 0.97, alpha: 0.98)
+    }
+
+    static let assistantBubbleDynamicNSColor = NSColor(
+        name: NSColor.Name("ClawdisChatTheme.assistantBubble"),
+        dynamicProvider: resolvedAssistantBubbleColor(for:))
+
+    static let onboardingAssistantBubbleDynamicNSColor = NSColor(
+        name: NSColor.Name("ClawdisChatTheme.onboardingAssistantBubble"),
+        dynamicProvider: resolvedOnboardingAssistantBubbleColor(for:))
+    #endif
+
     static var surface: Color {
         #if os(macOS)
         Color(nsColor: .windowBackgroundColor)
+        #else
+        Color(uiColor: .systemBackground)
+        #endif
+    }
+
+    @ViewBuilder
+    static var background: some View {
+        #if os(macOS)
+        ZStack {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.12),
+                    Color(nsColor: .windowBackgroundColor).opacity(0.35),
+                    Color.black.opacity(0.35),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing)
+            RadialGradient(
+                colors: [
+                    Color(nsColor: .systemOrange).opacity(0.14),
+                    .clear,
+                ],
+                center: .topLeading,
+                startRadius: 40,
+                endRadius: 320)
+            RadialGradient(
+                colors: [
+                    Color(nsColor: .systemTeal).opacity(0.12),
+                    .clear,
+                ],
+                center: .topTrailing,
+                startRadius: 40,
+                endRadius: 280)
+            Color.black.opacity(0.08)
+        }
         #else
         Color(uiColor: .systemBackground)
         #endif
@@ -23,11 +92,11 @@ enum ClawdisChatTheme {
         #endif
     }
 
-    static var subtleCard: Color {
+    static var subtleCard: AnyShapeStyle {
         #if os(macOS)
-        Color(nsColor: .textBackgroundColor).opacity(0.55)
+        AnyShapeStyle(.ultraThinMaterial)
         #else
-        Color(uiColor: .secondarySystemBackground).opacity(0.9)
+        AnyShapeStyle(Color(uiColor: .secondarySystemBackground).opacity(0.9))
         #endif
     }
 
@@ -41,9 +110,25 @@ enum ClawdisChatTheme {
 
     static var assistantBubble: Color {
         #if os(macOS)
-        Color(nsColor: .controlBackgroundColor)
+        Color(nsColor: self.assistantBubbleDynamicNSColor)
         #else
         Color(uiColor: .secondarySystemBackground)
+        #endif
+    }
+
+    static var onboardingAssistantBubble: Color {
+        #if os(macOS)
+        Color(nsColor: self.onboardingAssistantBubbleDynamicNSColor)
+        #else
+        Color(uiColor: .secondarySystemBackground)
+        #endif
+    }
+
+    static var onboardingAssistantBorder: Color {
+        #if os(macOS)
+        Color.white.opacity(0.12)
+        #else
+        Color.white.opacity(0.12)
         #endif
     }
 
@@ -57,24 +142,24 @@ enum ClawdisChatTheme {
         #endif
     }
 
-    static var composerBackground: Color {
+    static var composerBackground: AnyShapeStyle {
         #if os(macOS)
-        Color(nsColor: .windowBackgroundColor)
+        AnyShapeStyle(.ultraThinMaterial)
         #else
-        Color(uiColor: .systemBackground)
+        AnyShapeStyle(Color(uiColor: .systemBackground))
         #endif
     }
 
-    static var composerField: Color {
+    static var composerField: AnyShapeStyle {
         #if os(macOS)
-        Color(nsColor: .textBackgroundColor)
+        AnyShapeStyle(.thinMaterial)
         #else
-        Color(uiColor: .secondarySystemBackground)
+        AnyShapeStyle(Color(uiColor: .secondarySystemBackground))
         #endif
     }
 
     static var composerBorder: Color {
-        Color.secondary.opacity(0.2)
+        Color.white.opacity(0.12)
     }
 
     static var divider: Color {

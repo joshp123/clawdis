@@ -46,7 +46,7 @@ Clawdis already uses:
 For the clawd browser-control server, use "family" ports:
 - Browser control HTTP API: `18791` (bridge + 1)
 - Browser CDP/debugging port: `18792` (control + 1)
-- Canvas host HTTP: **same as the Gateway port** (`18789`), mounted at `/__clawdis__/canvas/`
+- Canvas host HTTP: `18793` by default, mounted at `/__clawdis__/canvas/`
 
 The user usually only configures the **control URL** (port `18791`). CDP is an
 internal detail.
@@ -167,8 +167,8 @@ Inspection:
 - `clawdis browser screenshot`
 - `clawdis browser screenshot --full-page`
 - `clawdis browser screenshot --ref 12`
+- `clawdis browser snapshot`
 - `clawdis browser snapshot --format aria --limit 200`
-- `clawdis browser snapshot --format ai`
 
 Actions:
 - `clawdis browser navigate https://example.com`
@@ -184,13 +184,15 @@ Actions:
 - `clawdis browser dialog --accept`
 - `clawdis browser wait --text "Done"`
 - `clawdis browser evaluate --fn '(el) => el.textContent' --ref 7`
+- `clawdis browser evaluate --fn "document.querySelector('.my-class').click()"`
 - `clawdis browser console --level error`
 - `clawdis browser pdf`
 
 Notes:
 - `upload` and `dialog` are **arming** calls; run them before the click/press that triggers the chooser/dialog.
 - The arm default timeout is **2 minutes** (clamped to max 2 minutes); pass `timeoutMs` if you need shorter.
-- `snapshot --format ai` returns AI snapshot markup used for ref-based actions.
+- `snapshot` defaults to `ai`; `aria` returns an accessibility tree for debugging.
+- `click`/`type` require `ref` from `snapshot --format ai`; use `evaluate` for rare CSS selector one-offs.
 
 ## Security & privacy notes
 

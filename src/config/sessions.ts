@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import type { Skill } from "@mariozechner/pi-coding-agent";
 import JSON5 from "json5";
 import type { MsgContext } from "../auto-reply/templating.js";
 import { normalizeE164 } from "../utils.js";
@@ -16,21 +17,25 @@ export type SessionEntry = {
   abortedLastRun?: boolean;
   thinkingLevel?: string;
   verboseLevel?: string;
+  providerOverride?: string;
+  modelOverride?: string;
+  groupActivation?: "mention" | "always";
+  groupActivationNeedsSystemIntro?: boolean;
+  queueMode?: "queue" | "interrupt";
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
   model?: string;
   contextTokens?: number;
-  lastChannel?: "whatsapp" | "telegram" | "webchat";
+  lastChannel?: "whatsapp" | "telegram" | "discord" | "webchat";
   lastTo?: string;
-  // Optional flag to mirror Mac app UI and future sync states.
-  syncing?: boolean | string;
   skillsSnapshot?: SessionSkillSnapshot;
 };
 
 export type SessionSkillSnapshot = {
   prompt: string;
   skills: Array<{ name: string; primaryEnv?: string }>;
+  resolvedSkills?: Skill[];
 };
 
 export function resolveSessionTranscriptsDir(): string {
@@ -41,6 +46,7 @@ export function resolveDefaultSessionStorePath(): string {
   return path.join(resolveSessionTranscriptsDir(), "sessions.json");
 }
 export const DEFAULT_RESET_TRIGGER = "/new";
+export const DEFAULT_RESET_TRIGGERS = ["/new", "/reset"];
 export const DEFAULT_IDLE_MINUTES = 60;
 
 export function resolveSessionTranscriptPath(sessionId: string): string {
@@ -125,12 +131,14 @@ export async function updateLastRoute(params: {
     abortedLastRun: existing?.abortedLastRun,
     thinkingLevel: existing?.thinkingLevel,
     verboseLevel: existing?.verboseLevel,
+    providerOverride: existing?.providerOverride,
+    modelOverride: existing?.modelOverride,
+    queueMode: existing?.queueMode,
     inputTokens: existing?.inputTokens,
     outputTokens: existing?.outputTokens,
     totalTokens: existing?.totalTokens,
     model: existing?.model,
     contextTokens: existing?.contextTokens,
-    syncing: existing?.syncing,
     skillsSnapshot: existing?.skillsSnapshot,
     lastChannel: channel,
     lastTo: to?.trim() ? to.trim() : undefined,

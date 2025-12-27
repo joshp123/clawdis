@@ -10,8 +10,10 @@ vi.mock("../media/store.js", () => ({
 }));
 
 const mockLoadConfig = vi.fn().mockReturnValue({
-  inbound: {
+  routing: {
     allowFrom: ["*"], // Allow all in tests by default
+  },
+  messages: {
     messagePrefix: undefined,
     responsePrefix: undefined,
     timestampPrefix: false,
@@ -106,6 +108,137 @@ describe("web monitor inbox", () => {
     expect(sock.sendPresenceUpdate).toHaveBeenCalledWith(
       "composing",
       "999@s.whatsapp.net",
+    );
+    expect(sock.sendMessage).toHaveBeenCalledWith("999@s.whatsapp.net", {
+      text: "pong",
+    });
+
+    await listener.close();
+  });
+
+  it("does not block follow-up messages when handler is pending", async () => {
+    let resolveFirst: (() => void) | null = null;
+    const onMessage = vi.fn(async () => {
+      if (!resolveFirst) {
+        await new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+    });
+
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: { id: "abc1", fromMe: false, remoteJid: "999@s.whatsapp.net" },
+          message: { conversation: "ping" },
+          messageTimestamp: 1_700_000_000,
+        },
+        {
+          key: { id: "abc2", fromMe: false, remoteJid: "999@s.whatsapp.net" },
+          message: { conversation: "pong" },
+          messageTimestamp: 1_700_000_001,
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledTimes(2);
+
+    resolveFirst?.();
+    await listener.close();
+  });
+
+  it("captures reply context from quoted messages", async () => {
+    const onMessage = vi.fn(async (msg) => {
+      await msg.reply("pong");
+    });
+
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: { id: "abc", fromMe: false, remoteJid: "999@s.whatsapp.net" },
+          message: {
+            extendedTextMessage: {
+              text: "reply",
+              contextInfo: {
+                stanzaId: "q1",
+                participant: "111@s.whatsapp.net",
+                quotedMessage: { conversation: "original" },
+              },
+            },
+          },
+          messageTimestamp: 1_700_000_000,
+          pushName: "Tester",
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replyToId: "q1",
+        replyToBody: "original",
+        replyToSender: "+111",
+      }),
+    );
+    expect(sock.sendMessage).toHaveBeenCalledWith("999@s.whatsapp.net", {
+      text: "pong",
+    });
+
+    await listener.close();
+  });
+
+  it("captures reply context from wrapped quoted messages", async () => {
+    const onMessage = vi.fn(async (msg) => {
+      await msg.reply("pong");
+    });
+
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: { id: "abc", fromMe: false, remoteJid: "999@s.whatsapp.net" },
+          message: {
+            extendedTextMessage: {
+              text: "reply",
+              contextInfo: {
+                stanzaId: "q1",
+                participant: "111@s.whatsapp.net",
+                quotedMessage: {
+                  viewOnceMessageV2Extension: {
+                    message: { conversation: "original" },
+                  },
+                },
+              },
+            },
+          },
+          messageTimestamp: 1_700_000_000,
+          pushName: "Tester",
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replyToId: "q1",
+        replyToBody: "original",
+        replyToSender: "+111",
+      }),
     );
     expect(sock.sendMessage).toHaveBeenCalledWith("999@s.whatsapp.net", {
       text: "pong",
@@ -317,8 +450,10 @@ describe("web monitor inbox", () => {
 
   it("still forwards group messages (with sender info) even when allowFrom is restrictive", async () => {
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["+111"], // does not include +777
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -371,8 +506,10 @@ describe("web monitor inbox", () => {
     // Test for auto-recovery fix: early allowFrom filtering prevents Bad MAC errors
     // from unauthorized senders corrupting sessions
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["+111"], // Only allow +111
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -404,11 +541,67 @@ describe("web monitor inbox", () => {
 
     // Should NOT call onMessage for unauthorized senders
     expect(onMessage).not.toHaveBeenCalled();
+    // Should NOT send read receipts for blocked senders (privacy + avoids Baileys Bad MAC churn).
+    expect(sock.readMessages).not.toHaveBeenCalled();
 
     // Reset mock for other tests
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["*"],
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    await listener.close();
+  });
+
+  it("skips read receipts in self-chat mode", async () => {
+    mockLoadConfig.mockReturnValue({
+      routing: {
+        // Self-chat heuristic: allowFrom includes selfE164 (+123).
+        allowFrom: ["+123"],
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: { id: "self1", fromMe: false, remoteJid: "123@s.whatsapp.net" },
+          message: { conversation: "self ping" },
+          messageTimestamp: 1_700_000_000,
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ from: "+123", to: "+123", body: "self ping" }),
+    );
+    expect(sock.readMessages).not.toHaveBeenCalled();
+
+    // Reset mock for other tests
+    mockLoadConfig.mockReturnValue({
+      routing: {
+        allowFrom: ["*"],
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -420,8 +613,10 @@ describe("web monitor inbox", () => {
 
   it("lets group messages through even when sender not in allowFrom", async () => {
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["+1234"],
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -460,8 +655,10 @@ describe("web monitor inbox", () => {
 
   it("allows messages from senders in allowFrom list", async () => {
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["+111", "+999"], // Allow +999
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -493,8 +690,10 @@ describe("web monitor inbox", () => {
 
     // Reset mock for other tests
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["*"],
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -508,8 +707,10 @@ describe("web monitor inbox", () => {
     // Same-phone mode: when from === selfJid, should always be allowed
     // This allows users to message themselves even with restrictive allowFrom
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["+111"], // Only allow +111, but self is +123
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -542,8 +743,10 @@ describe("web monitor inbox", () => {
 
     // Reset mock for other tests
     mockLoadConfig.mockReturnValue({
-      inbound: {
+      routing: {
         allowFrom: ["*"],
+      },
+      messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
@@ -607,8 +810,10 @@ it("defaults to self-only when no config is present", async () => {
 
   // Reset mock for other tests
   mockLoadConfig.mockReturnValue({
-    inbound: {
+    routing: {
       allowFrom: ["*"],
+    },
+    messages: {
       messagePrefix: undefined,
       responsePrefix: undefined,
       timestampPrefix: false,

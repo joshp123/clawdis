@@ -3,23 +3,22 @@ import Observation
 import SwiftUI
 
 struct SkillsSettings: View {
+    @Bindable var state: AppState
     @State private var model = SkillsSettingsModel()
     @State private var envEditor: EnvEditorState?
-    @State private var searchQuery = ""
     @State private var filter: SkillsFilter = .all
 
+    init(state: AppState = AppStateStore.shared, model: SkillsSettingsModel = SkillsSettingsModel()) {
+        self.state = state
+        self._model = State(initialValue: model)
+    }
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                self.header
-                self.filterBar
-                self.statusBanner
-                self.skillsList
-                Spacer(minLength: 0)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 24)
-            .padding(.vertical, 18)
+        VStack(alignment: .leading, spacing: 12) {
+            self.header
+            self.statusBanner
+            self.skillsList
+            Spacer(minLength: 0)
         }
         .task { await self.model.refresh() }
         .sheet(item: self.$envEditor) { editor in
@@ -36,17 +35,27 @@ struct SkillsSettings: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
                 Text("Skills")
-                    .font(.title3.weight(.semibold))
+                    .font(.headline)
                 Text("Skills are enabled when requirements are met (binaries, env, config).")
-                    .font(.callout)
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Refresh") { Task { await self.model.refresh() } }
-                .disabled(self.model.isLoading)
+            if self.model.isLoading {
+                ProgressView()
+            } else {
+                Button {
+                    Task { await self.model.refresh() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .help("Refresh")
+            }
+            self.headerFilter
         }
     }
 
@@ -63,70 +72,65 @@ struct SkillsSettings: View {
         }
     }
 
+    @ViewBuilder
     private var skillsList: some View {
-        VStack(spacing: 10) {
-            ForEach(self.filteredSkills) { skill in
-                SkillRow(
-                    skill: skill,
-                    isBusy: self.model.isBusy(skill: skill),
-                    onToggleEnabled: { enabled in
-                        Task { await self.model.setEnabled(skillKey: skill.skillKey, enabled: enabled) }
-                    },
-                    onInstall: { option in
-                        Task { await self.model.install(skill: skill, option: option) }
-                    },
-                    onSetEnv: { envKey, isPrimary in
-                        self.envEditor = EnvEditorState(
-                            skillKey: skill.skillKey,
-                            skillName: skill.name,
-                            envKey: envKey,
-                            isPrimary: isPrimary)
-                    })
+        if self.model.skills.isEmpty {
+            Text("No skills reported yet.")
+                .foregroundStyle(.secondary)
+        } else {
+            List {
+                ForEach(self.filteredSkills) { skill in
+                    SkillRow(
+                        skill: skill,
+                        isBusy: self.model.isBusy(skill: skill),
+                        connectionMode: self.state.connectionMode,
+                        onToggleEnabled: { enabled in
+                            Task { await self.model.setEnabled(skillKey: skill.skillKey, enabled: enabled) }
+                        },
+                        onInstall: { option, target in
+                            Task { await self.model.install(skill: skill, option: option, target: target) }
+                        },
+                        onSetEnv: { envKey, isPrimary in
+                            self.envEditor = EnvEditorState(
+                                skillKey: skill.skillKey,
+                                skillName: skill.name,
+                                envKey: envKey,
+                                isPrimary: isPrimary)
+                        })
+                }
+                if !self.model.skills.isEmpty, self.filteredSkills.isEmpty {
+                    Text("No skills match this filter.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
-            if !self.model.skills.isEmpty && self.filteredSkills.isEmpty {
-                Text("No skills match this filter.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 4)
-            }
+            .listStyle(.inset)
         }
     }
 
-    private var filterBar: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            TextField("Search skills", text: self.$searchQuery)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 320)
-            Picker("Filter", selection: self.$filter) {
-                ForEach(SkillsFilter.allCases) { filter in
-                    Text(filter.title)
-                        .tag(filter)
-                }
+    private var headerFilter: some View {
+        Picker("Filter", selection: self.$filter) {
+            ForEach(SkillsFilter.allCases) { filter in
+                Text(filter.title)
+                    .tag(filter)
             }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 420)
         }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 160, alignment: .trailing)
     }
 
     private var filteredSkills: [SkillStatus] {
-        let trimmed = self.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        let query = trimmed.lowercased()
-        return self.model.skills.filter { skill in
-            if !query.isEmpty {
-                let matchesName = skill.name.lowercased().contains(query)
-                let matchesDescription = skill.description.lowercased().contains(query)
-                if !(matchesName || matchesDescription) { return false }
-            }
+        self.model.skills.filter { skill in
             switch self.filter {
             case .all:
-                return true
+                true
             case .ready:
-                return !skill.disabled && skill.eligible
+                !skill.disabled && skill.eligible
             case .needsSetup:
-                return !skill.disabled && !skill.eligible
+                !skill.disabled && !skill.eligible
             case .disabled:
-                return skill.disabled
+                skill.disabled
             }
         }
     }
@@ -143,99 +147,101 @@ private enum SkillsFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .all:
-            return "All"
+            "All"
         case .ready:
-            return "Ready"
+            "Ready"
         case .needsSetup:
-            return "Needs Setup"
+            "Needs Setup"
         case .disabled:
-            return "Disabled"
+            "Disabled"
         }
     }
+}
+
+private enum InstallTarget: String, CaseIterable {
+    case gateway
+    case local
 }
 
 private struct SkillRow: View {
     let skill: SkillStatus
     let isBusy: Bool
+    let connectionMode: AppState.ConnectionMode
     let onToggleEnabled: (Bool) -> Void
-    let onInstall: (SkillInstallOption) -> Void
+    let onInstall: (SkillInstallOption, InstallTarget) -> Void
     let onSetEnv: (String, Bool) -> Void
 
     private var missingBins: [String] { self.skill.missing.bins }
     private var missingEnv: [String] { self.skill.missing.env }
     private var missingConfig: [String] { self.skill.missing.config }
 
+    init(
+        skill: SkillStatus,
+        isBusy: Bool,
+        connectionMode: AppState.ConnectionMode,
+        onToggleEnabled: @escaping (Bool) -> Void,
+        onInstall: @escaping (SkillInstallOption, InstallTarget) -> Void,
+        onSetEnv: @escaping (String, Bool) -> Void)
+    {
+        self.skill = skill
+        self.isBusy = isBusy
+        self.connectionMode = connectionMode
+        self.onToggleEnabled = onToggleEnabled
+        self.onInstall = onInstall
+        self.onSetEnv = onSetEnv
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 12) {
-                Text(self.skill.emoji ?? "✨")
-                    .font(.title2)
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(self.skill.name)
-                            .font(.headline)
-                        self.statusBadge
-                    }
-                    Text(self.skill.description)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    self.metaRow
-                }
-                Spacer()
-            }
+        HStack(alignment: .top, spacing: 12) {
+            Text(self.skill.emoji ?? "✨")
+                .font(.title2)
 
-            if self.skill.disabled {
-                Text("Disabled in config")
-                    .font(.caption)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(self.skill.name)
+                    .font(.headline)
+                Text(self.skill.description)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
-            } else if !self.skill.eligible {
-                self.missingSummary
+                    .fixedSize(horizontal: false, vertical: true)
+                self.metaRow
+
+                if self.skill.disabled {
+                    Text("Disabled in config")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if !self.requirementsMet, self.shouldShowMissingSummary {
+                    self.missingSummary
+                }
+
+                if !self.skill.configChecks.isEmpty {
+                    self.configChecksView
+                }
+
+                if !self.missingEnv.isEmpty {
+                    self.envActionRow
+                }
             }
 
-            if !self.skill.configChecks.isEmpty {
-                self.configChecksView
-            }
+            Spacer(minLength: 0)
 
-            self.actionRow
+            self.trailingActions
         }
-        .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+        .padding(.vertical, 6)
     }
 
     private var sourceLabel: String {
         switch self.skill.source {
         case "clawdis-bundled":
-            return "Bundled"
+            "Bundled"
         case "clawdis-managed":
-            return "Managed"
+            "Managed"
         case "clawdis-workspace":
-            return "Workspace"
+            "Workspace"
         case "clawdis-extra":
-            return "Extra"
+            "Extra"
         default:
-            return self.skill.source
+            self.skill.source
         }
-    }
-
-    private var statusBadge: some View {
-        Group {
-            if self.skill.disabled {
-                Label("Disabled", systemImage: "slash.circle")
-                    .foregroundStyle(.secondary)
-            } else if self.skill.eligible {
-                Label("Ready", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            } else {
-                Label("Needs setup", systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
-        }
-        .font(.caption)
     }
 
     private var metaRow: some View {
@@ -248,21 +254,8 @@ private struct SkillRow: View {
                 }
                 .buttonStyle(.link)
             }
-            HStack(spacing: 6) {
-                Text(self.enabledLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Toggle("", isOn: self.enabledBinding)
-                    .toggleStyle(.switch)
-                    .labelsHidden()
-                    .disabled(self.isBusy)
-            }
             Spacer(minLength: 0)
         }
-    }
-
-    private var enabledLabel: String {
-        self.skill.disabled ? "Disabled" : "Enabled"
     }
 
     private var homepageUrl: URL? {
@@ -282,7 +275,7 @@ private struct SkillRow: View {
     @ViewBuilder
     private var missingSummary: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if !self.missingBins.isEmpty {
+            if self.shouldShowMissingBins {
                 Text("Missing binaries: \(self.missingBins.joined(separator: ", "))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -317,14 +310,8 @@ private struct SkillRow: View {
         }
     }
 
-    private var actionRow: some View {
+    private var envActionRow: some View {
         HStack(spacing: 8) {
-            ForEach(self.installOptions) { option in
-                Button(option.label) { self.onInstall(option) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(self.isBusy)
-            }
-
             ForEach(self.missingEnv, id: \.self) { envKey in
                 let isPrimary = envKey == self.skill.primaryEnv
                 Button(isPrimary ? "Set API Key" : "Set \(envKey)") {
@@ -333,8 +320,51 @@ private struct SkillRow: View {
                 .buttonStyle(.bordered)
                 .disabled(self.isBusy)
             }
-
             Spacer(minLength: 0)
+        }
+    }
+
+    @ViewBuilder
+    private var trailingActions: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if !self.installOptions.isEmpty {
+                ForEach(self.installOptions, id: \.id) { (option: SkillInstallOption) in
+                    HStack(spacing: 6) {
+                        if self.showGatewayInstall {
+                            Button("Install on Gateway") { self.onInstall(option, .gateway) }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(self.isBusy)
+                        }
+                        if self.showGatewayInstall {
+                            Button("Install on This Mac") { self.onInstall(option, .local) }
+                                .buttonStyle(.bordered)
+                                .disabled(self.isBusy)
+                                .help(
+                                    self.localInstallNeedsSwitch
+                                        ? "Switches to Local mode to install on this Mac."
+                                        : "")
+                        } else {
+                            Button("Install on This Mac") { self.onInstall(option, .local) }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(self.isBusy)
+                                .help(
+                                    self.localInstallNeedsSwitch
+                                        ? "Switches to Local mode to install on this Mac."
+                                        : "")
+                        }
+                    }
+                }
+            } else {
+                Toggle("", isOn: self.enabledBinding)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .disabled(self.isBusy || !self.requirementsMet)
+            }
+
+            if self.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+            }
         }
     }
 
@@ -345,6 +375,28 @@ private struct SkillRow: View {
             if option.bins.isEmpty { return true }
             return !missing.isDisjoint(with: option.bins)
         }
+    }
+
+    private var requirementsMet: Bool {
+        self.missingBins.isEmpty && self.missingEnv.isEmpty && self.missingConfig.isEmpty
+    }
+
+    private var shouldShowMissingBins: Bool {
+        !self.missingBins.isEmpty && self.installOptions.isEmpty
+    }
+
+    private var shouldShowMissingSummary: Bool {
+        self.shouldShowMissingBins ||
+            !self.missingEnv.isEmpty ||
+            !self.missingConfig.isEmpty
+    }
+
+    private var showGatewayInstall: Bool {
+        self.connectionMode == .remote
+    }
+
+    private var localInstallNeedsSwitch: Bool {
+        self.connectionMode != .local
     }
 
     private func formatConfigValue(_ value: AnyCodable?) -> String {
@@ -452,9 +504,13 @@ final class SkillsSettingsModel {
         self.isLoading = false
     }
 
-    func install(skill: SkillStatus, option: SkillInstallOption) async {
+    fileprivate func install(skill: SkillStatus, option: SkillInstallOption, target: InstallTarget) async {
         await self.withBusy(skill.skillKey) {
             do {
+                if target == .local, AppStateStore.shared.connectionMode != .local {
+                    AppStateStore.shared.connectionMode = .local
+                    self.statusMessage = "Switched to Local mode to install on this Mac"
+                }
                 let result = try await GatewayConnection.shared.skillsInstall(
                     name: skill.name,
                     installId: option.id,
@@ -512,8 +568,59 @@ final class SkillsSettingsModel {
 #if DEBUG
 struct SkillsSettings_Previews: PreviewProvider {
     static var previews: some View {
-        SkillsSettings()
+        SkillsSettings(state: .preview)
             .frame(width: SettingsTab.windowWidth, height: SettingsTab.windowHeight)
+    }
+}
+
+extension SkillsSettings {
+    static func exerciseForTesting() {
+        let skill = SkillStatus(
+            name: "Test Skill",
+            description: "Test description",
+            source: "clawdis-bundled",
+            filePath: "/tmp/skills/test",
+            baseDir: "/tmp/skills",
+            skillKey: "test",
+            primaryEnv: "API_KEY",
+            emoji: "🧪",
+            homepage: "https://example.com",
+            always: false,
+            disabled: false,
+            eligible: false,
+            requirements: SkillRequirements(bins: ["python3"], env: ["API_KEY"], config: ["skills.test"]),
+            missing: SkillMissing(bins: ["python3"], env: ["API_KEY"], config: ["skills.test"]),
+            configChecks: [
+                SkillStatusConfigCheck(path: "skills.test", value: AnyCodable(false), satisfied: false),
+            ],
+            install: [
+                SkillInstallOption(id: "brew", kind: "brew", label: "brew install python", bins: ["python3"]),
+            ])
+
+        let row = SkillRow(
+            skill: skill,
+            isBusy: false,
+            connectionMode: .remote,
+            onToggleEnabled: { _ in },
+            onInstall: { _, _ in },
+            onSetEnv: { _, _ in })
+        _ = row.body
+
+        _ = SkillTag(text: "Bundled").body
+
+        let editor = EnvEditorView(
+            editor: EnvEditorState(
+                skillKey: "test",
+                skillName: "Test Skill",
+                envKey: "API_KEY",
+                isPrimary: true),
+            onSave: { _ in })
+        _ = editor.body
+    }
+
+    mutating func setFilterForTesting(_ rawValue: String) {
+        guard let filter = SkillsFilter(rawValue: rawValue) else { return }
+        self.filter = filter
     }
 }
 #endif

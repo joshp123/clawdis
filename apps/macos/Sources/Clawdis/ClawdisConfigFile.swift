@@ -20,6 +20,7 @@ enum ClawdisConfigFile {
     }
 
     static func saveDict(_ dict: [String: Any]) {
+        if ProcessInfo.processInfo.isNixMode { return }
         do {
             let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
             let url = self.url()
@@ -28,6 +29,23 @@ enum ClawdisConfigFile {
                 withIntermediateDirectories: true)
             try data.write(to: url, options: [.atomic])
         } catch {}
+    }
+
+    static func loadGatewayDict() -> [String: Any] {
+        let root = self.loadDict()
+        return root["gateway"] as? [String: Any] ?? [:]
+    }
+
+    static func updateGatewayDict(_ mutate: (inout [String: Any]) -> Void) {
+        var root = self.loadDict()
+        var gateway = root["gateway"] as? [String: Any] ?? [:]
+        mutate(&gateway)
+        if gateway.isEmpty {
+            root.removeValue(forKey: "gateway")
+        } else {
+            root["gateway"] = gateway
+        }
+        self.saveDict(root)
     }
 
     static func browserControlEnabled(defaultValue: Bool = true) -> Bool {
@@ -44,46 +62,22 @@ enum ClawdisConfigFile {
         self.saveDict(root)
     }
 
-    static func inboundWorkspace() -> String? {
+    static func agentWorkspace() -> String? {
         let root = self.loadDict()
-        let inbound = root["inbound"] as? [String: Any]
-        return inbound?["workspace"] as? String
+        let agent = root["agent"] as? [String: Any]
+        return agent?["workspace"] as? String
     }
 
-    static func setInboundWorkspace(_ workspace: String?) {
+    static func setAgentWorkspace(_ workspace: String?) {
         var root = self.loadDict()
-        var inbound = root["inbound"] as? [String: Any] ?? [:]
+        var agent = root["agent"] as? [String: Any] ?? [:]
         let trimmed = workspace?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if trimmed.isEmpty {
-            inbound.removeValue(forKey: "workspace")
+            agent.removeValue(forKey: "workspace")
         } else {
-            inbound["workspace"] = trimmed
+            agent["workspace"] = trimmed
         }
-        root["inbound"] = inbound
-        self.saveDict(root)
-    }
-
-    static func loadIdentity() -> AgentIdentity? {
-        let root = self.loadDict()
-        guard let identity = root["identity"] as? [String: Any] else { return nil }
-        let name = identity["name"] as? String ?? ""
-        let theme = identity["theme"] as? String ?? ""
-        let emoji = identity["emoji"] as? String ?? ""
-        let result = AgentIdentity(name: name, theme: theme, emoji: emoji)
-        return result.isEmpty ? nil : result
-    }
-
-    static func setIdentity(_ identity: AgentIdentity?) {
-        var root = self.loadDict()
-        if let identity, !identity.isEmpty {
-            root["identity"] = [
-                "name": identity.name.trimmingCharacters(in: .whitespacesAndNewlines),
-                "theme": identity.theme.trimmingCharacters(in: .whitespacesAndNewlines),
-                "emoji": identity.emoji.trimmingCharacters(in: .whitespacesAndNewlines),
-            ]
-        } else {
-            root.removeValue(forKey: "identity")
-        }
+        root["agent"] = agent
         self.saveDict(root)
     }
 }

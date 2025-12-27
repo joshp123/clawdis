@@ -9,8 +9,8 @@ export const browserCoreExamples = [
   "clawdis browser screenshot",
   "clawdis browser screenshot --full-page",
   "clawdis browser screenshot --ref 12",
+  "clawdis browser snapshot",
   "clawdis browser snapshot --format aria --limit 200",
-  "clawdis browser snapshot --format ai",
 ];
 
 export const browserActionExamples = [

@@ -5,6 +5,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_PROVIDER,
 } from "../agents/defaults.js";
+import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
 import {
@@ -52,7 +53,7 @@ function pickSummaryFromPayloads(
 function resolveDeliveryTarget(
   cfg: ClawdisConfig,
   jobPayload: {
-    channel?: "last" | "whatsapp" | "telegram";
+    channel?: "last" | "whatsapp" | "telegram" | "discord";
     to?: string;
   },
 ) {
@@ -63,7 +64,7 @@ function resolveDeliveryTarget(
       ? jobPayload.to.trim()
       : undefined;
 
-  const sessionCfg = cfg.inbound?.session;
+  const sessionCfg = cfg.session;
   const mainKey = (sessionCfg?.mainKey ?? "main").trim() || "main";
   const storePath = resolveStorePath(sessionCfg?.store);
   const store = loadSessionStore(storePath);
@@ -75,7 +76,11 @@ function resolveDeliveryTarget(
   const lastTo = typeof main?.lastTo === "string" ? main.lastTo.trim() : "";
 
   const channel = (() => {
-    if (requestedChannel === "whatsapp" || requestedChannel === "telegram") {
+    if (
+      requestedChannel === "whatsapp" ||
+      requestedChannel === "telegram" ||
+      requestedChannel === "discord"
+    ) {
       return requestedChannel;
     }
     return lastChannel ?? "whatsapp";
@@ -88,7 +93,7 @@ function resolveDeliveryTarget(
 
   const sanitizedWhatsappTo = (() => {
     if (channel !== "whatsapp") return to;
-    const rawAllow = cfg.inbound?.allowFrom ?? [];
+    const rawAllow = cfg.routing?.allowFrom ?? [];
     if (rawAllow.includes("*")) return to;
     const allowFrom = rawAllow
       .map((val) => normalizeE164(val))
@@ -111,7 +116,7 @@ function resolveCronSession(params: {
   sessionKey: string;
   nowMs: number;
 }) {
-  const sessionCfg = params.cfg.inbound?.session;
+  const sessionCfg = params.cfg.session;
   const idleMinutes = Math.max(
     sessionCfg?.idleMinutes ?? DEFAULT_IDLE_MINUTES,
     1,
@@ -133,7 +138,6 @@ function resolveCronSession(params: {
     contextTokens: entry?.contextTokens,
     lastChannel: entry?.lastChannel,
     lastTo: entry?.lastTo,
-    syncing: entry?.syncing,
   };
   return { storePath, store, sessionEntry, systemSent, isNewSession: !fresh };
 }
@@ -146,18 +150,20 @@ export async function runCronIsolatedAgentTurn(params: {
   sessionKey: string;
   lane?: string;
 }): Promise<RunCronAgentTurnResult> {
-  const agentCfg = params.cfg.inbound?.agent;
-  void params.lane;
+  const agentCfg = params.cfg.agent;
   const workspaceDirRaw =
-    params.cfg.inbound?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
+    params.cfg.agent?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
   const workspace = await ensureAgentWorkspace({
     dir: workspaceDirRaw,
     ensureBootstrapFiles: true,
   });
   const workspaceDir = workspace.dir;
 
-  const provider = agentCfg?.provider?.trim() || DEFAULT_PROVIDER;
-  const model = agentCfg?.model?.trim() || DEFAULT_MODEL;
+  const { provider, model } = resolveConfiguredModelRef({
+    cfg: params.cfg,
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
   const now = Date.now();
   const cronSession = resolveCronSession({
     cfg: params.cfg,
@@ -201,7 +207,7 @@ export async function runCronIsolatedAgentTurn(params: {
   });
 
   const base =
-    `[cron:${params.job.id}${params.job.name ? ` ${params.job.name}` : ""}] ${params.message}`.trim();
+    `[cron:${params.job.id} ${params.job.name}] ${params.message}`.trim();
 
   const commandBody = base;
 
@@ -237,11 +243,13 @@ export async function runCronIsolatedAgentTurn(params: {
     );
     runResult = await runEmbeddedPiAgent({
       sessionId: cronSession.sessionEntry.sessionId,
+      sessionKey: params.sessionKey,
       sessionFile,
       workspaceDir,
       config: params.cfg,
       skillsSnapshot,
       prompt: commandBody,
+      lane: params.lane ?? "cron",
       provider,
       model,
       thinkLevel,
@@ -352,6 +360,50 @@ export async function runCronIsolatedAgentTurn(params: {
               first = false;
               await params.deps.sendMessageTelegram(chatId, caption, {
                 verbose: false,
+                mediaUrl: url,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        if (!bestEffortDeliver)
+          return { status: "error", summary, error: String(err) };
+        return { status: "ok", summary };
+      }
+    } else if (resolvedDelivery.channel === "discord") {
+      if (!resolvedDelivery.to) {
+        if (!bestEffortDeliver)
+          return {
+            status: "error",
+            summary,
+            error:
+              "Cron delivery to Discord requires --channel discord and --to <channelId|user:ID>",
+          };
+        return {
+          status: "skipped",
+          summary: "Delivery skipped (no Discord destination).",
+        };
+      }
+      const discordTarget = resolvedDelivery.to;
+      try {
+        for (const payload of payloads) {
+          const mediaList =
+            payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
+          if (mediaList.length === 0) {
+            await params.deps.sendMessageDiscord(
+              discordTarget,
+              payload.text ?? "",
+              {
+                token: process.env.DISCORD_BOT_TOKEN,
+              },
+            );
+          } else {
+            let first = true;
+            for (const url of mediaList) {
+              const caption = first ? (payload.text ?? "") : "";
+              first = false;
+              await params.deps.sendMessageDiscord(discordTarget, caption, {
+                token: process.env.DISCORD_BOT_TOKEN,
                 mediaUrl: url,
               });
             }

@@ -16,6 +16,7 @@ import com.steipete.clawdis.node.bridge.BridgeEndpoint
 import com.steipete.clawdis.node.bridge.BridgePairingClient
 import com.steipete.clawdis.node.bridge.BridgeSession
 import com.steipete.clawdis.node.node.CameraCaptureManager
+import com.steipete.clawdis.node.BuildConfig
 import com.steipete.clawdis.node.node.CanvasController
 import com.steipete.clawdis.node.node.ScreenRecordManager
 import com.steipete.clawdis.node.protocol.ClawdisCapability
@@ -109,6 +110,8 @@ class NodeRuntime(context: Context) {
   private val _isForeground = MutableStateFlow(true)
   val isForeground: StateFlow<Boolean> = _isForeground.asStateFlow()
 
+  private var lastAutoA2uiUrl: String? = null
+
   private val session =
     BridgeSession(
       scope = scope,
@@ -118,6 +121,7 @@ class NodeRuntime(context: Context) {
         _remoteAddress.value = remote
         _isConnected.value = true
         scope.launch { refreshWakeWordsFromGateway() }
+        maybeNavigateToA2uiOnConnect()
       },
       onDisconnected = { message -> handleSessionDisconnected(message) },
       onEvent = { event, payloadJson ->
@@ -136,6 +140,21 @@ class NodeRuntime(context: Context) {
     _remoteAddress.value = null
     _isConnected.value = false
     chat.onDisconnected(message)
+    showLocalCanvasOnDisconnect()
+  }
+
+  private fun maybeNavigateToA2uiOnConnect() {
+    val a2uiUrl = resolveA2uiHostUrl() ?: return
+    val current = canvas.currentUrl()?.trim().orEmpty()
+    if (current.isEmpty() || current == lastAutoA2uiUrl) {
+      lastAutoA2uiUrl = a2uiUrl
+      canvas.navigate(a2uiUrl)
+    }
+  }
+
+  private fun showLocalCanvasOnDisconnect() {
+    lastAutoA2uiUrl = null
+    canvas.navigate("")
   }
 
   val instanceId: StateFlow<String> = prefs.instanceId
@@ -148,6 +167,7 @@ class NodeRuntime(context: Context) {
   val manualHost: StateFlow<String> = prefs.manualHost
   val manualPort: StateFlow<Int> = prefs.manualPort
   val lastDiscoveredStableId: StateFlow<String> = prefs.lastDiscoveredStableId
+  val canvasDebugStatusEnabled: StateFlow<Boolean> = prefs.canvasDebugStatusEnabled
 
   private var didAutoConnect = false
   private var suppressWakeWordsSync = false
@@ -228,6 +248,22 @@ class NodeRuntime(context: Context) {
         connect(target)
       }
     }
+
+    scope.launch {
+      combine(
+        canvasDebugStatusEnabled,
+        statusText,
+        serverName,
+        remoteAddress,
+      ) { debugEnabled, status, server, remote ->
+        Quad(debugEnabled, status, server, remote)
+      }.distinctUntilChanged()
+        .collect { (debugEnabled, status, server, remote) ->
+          canvas.setDebugStatusEnabled(debugEnabled)
+          if (!debugEnabled) return@collect
+          canvas.setDebugStatus(status, server ?: remote)
+        }
+    }
   }
 
   fun setForeground(value: Boolean) {
@@ -256,6 +292,10 @@ class NodeRuntime(context: Context) {
 
   fun setManualPort(value: Int) {
     prefs.setManualPort(value)
+  }
+
+  fun setCanvasDebugStatusEnabled(value: Boolean) {
+    prefs.setCanvasDebugStatusEnabled(value)
   }
 
   fun setWakeWords(words: List<String>) {
@@ -307,6 +347,13 @@ class NodeRuntime(context: Context) {
               add(ClawdisCapability.VoiceWake.rawValue)
             }
           }
+          val versionName = BuildConfig.VERSION_NAME.trim().ifEmpty { "dev" }
+          val advertisedVersion =
+            if (BuildConfig.DEBUG && !versionName.contains("dev", ignoreCase = true)) {
+              "$versionName-dev"
+            } else {
+              versionName
+            }
           BridgePairingClient().pairAndHello(
             endpoint = endpoint,
             hello =
@@ -315,7 +362,7 @@ class NodeRuntime(context: Context) {
                 displayName = displayName.value,
                 token = null,
                 platform = "Android",
-                version = "dev",
+                version = advertisedVersion,
                 deviceFamily = "Android",
                 modelIdentifier = modelIdentifier,
                 caps = caps,
@@ -333,6 +380,13 @@ class NodeRuntime(context: Context) {
 
       val authToken = requireNotNull(resolved.token).trim()
       prefs.saveBridgeToken(authToken)
+      val versionName = BuildConfig.VERSION_NAME.trim().ifEmpty { "dev" }
+      val advertisedVersion =
+        if (BuildConfig.DEBUG && !versionName.contains("dev", ignoreCase = true)) {
+          "$versionName-dev"
+        } else {
+          versionName
+        }
       session.connect(
         endpoint = endpoint,
         hello =
@@ -341,7 +395,7 @@ class NodeRuntime(context: Context) {
             displayName = displayName.value,
             token = authToken,
             platform = "Android",
-            version = "dev",
+            version = advertisedVersion,
             deviceFamily = "Android",
             modelIdentifier = modelIdentifier,
             caps =
@@ -396,8 +450,7 @@ class NodeRuntime(context: Context) {
       val actionId = (userActionObj["id"] as? JsonPrimitive)?.content?.trim().orEmpty().ifEmpty {
         java.util.UUID.randomUUID().toString()
       }
-      val name = (userActionObj["name"] as? JsonPrimitive)?.content?.trim().orEmpty()
-      if (name.isEmpty()) return@launch
+      val name = ClawdisCanvasA2UIAction.extractActionName(userActionObj) ?: return@launch
 
       val surfaceId =
         (userActionObj["surfaceId"] as? JsonPrimitive)?.content?.trim().orEmpty().ifEmpty { "main" }

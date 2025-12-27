@@ -3,10 +3,11 @@ set -euo pipefail
 
 APP_BUNDLE="${1:-dist/Clawdis.app}"
 IDENTITY="${SIGN_IDENTITY:-}"
-ENT_TMP_BASE=$(mktemp -t clawdis-entitlements-base)
-ENT_TMP_APP=$(mktemp -t clawdis-entitlements-app)
-ENT_TMP_APP_BASE=$(mktemp -t clawdis-entitlements-app-base)
-ENT_TMP_BUN=$(mktemp -t clawdis-entitlements-bun)
+TIMESTAMP_MODE="${CODESIGN_TIMESTAMP:-auto}"
+ENT_TMP_BASE=$(mktemp -t clawdis-entitlements-base.XXXXXX)
+ENT_TMP_APP=$(mktemp -t clawdis-entitlements-app.XXXXXX)
+ENT_TMP_APP_BASE=$(mktemp -t clawdis-entitlements-app-base.XXXXXX)
+ENT_TMP_BUN=$(mktemp -t clawdis-entitlements-bun.XXXXXX)
 
 if [ ! -d "$APP_BUNDLE" ]; then
   echo "App bundle not found: $APP_BUNDLE" >&2
@@ -20,6 +21,22 @@ select_identity() {
   preferred="$(security find-identity -p codesigning -v 2>/dev/null \
     | awk -F'\"' '/Developer ID Application/ { print $2; exit }')"
 
+  if [ -n "$preferred" ]; then
+    echo "$preferred"
+    return
+  fi
+
+  # Next, try Apple Distribution.
+  preferred="$(security find-identity -p codesigning -v 2>/dev/null \
+    | awk -F'\"' '/Apple Distribution/ { print $2; exit }')"
+  if [ -n "$preferred" ]; then
+    echo "$preferred"
+    return
+  fi
+
+  # Then, try Apple Development.
+  preferred="$(security find-identity -p codesigning -v 2>/dev/null \
+    | awk -F'\"' '/Apple Development/ { print $2; exit }')"
   if [ -n "$preferred" ]; then
     echo "$preferred"
     return
@@ -46,6 +63,28 @@ if [ -z "$IDENTITY" ]; then
 fi
 
 echo "Using signing identity: $IDENTITY"
+
+timestamp_arg="--timestamp=none"
+case "$TIMESTAMP_MODE" in
+  1|on|yes|true)
+    timestamp_arg="--timestamp"
+    ;;
+  0|off|no|false)
+    timestamp_arg="--timestamp=none"
+    ;;
+  auto)
+    if [[ "$IDENTITY" == *"Developer ID Application"* ]]; then
+      timestamp_arg="--timestamp"
+    fi
+    ;;
+  *)
+    echo "ERROR: Unknown CODESIGN_TIMESTAMP value: $TIMESTAMP_MODE (use auto|on|off)" >&2
+    exit 1
+    ;;
+esac
+
+options_args=("--options" "runtime")
+timestamp_args=("$timestamp_arg")
 
 cat > "$ENT_TMP_BASE" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -118,12 +157,12 @@ xattr -cr "$APP_BUNDLE" 2>/dev/null || true
 sign_item() {
   local target="$1"
   local entitlements="$2"
-  codesign --force --options runtime --timestamp=none --entitlements "$entitlements" --sign "$IDENTITY" "$target"
+  codesign --force "${options_args[@]}" "${timestamp_args[@]}" --entitlements "$entitlements" --sign "$IDENTITY" "$target"
 }
 
 sign_plain_item() {
   local target="$1"
-  codesign --force --options runtime --timestamp=none --sign "$IDENTITY" "$target"
+  codesign --force "${options_args[@]}" "${timestamp_args[@]}" --sign "$IDENTITY" "$target"
 }
 
 # Sign main binary
@@ -136,11 +175,8 @@ if [ -d "$APP_BUNDLE/Contents/Resources/Relay" ]; then
   find "$APP_BUNDLE/Contents/Resources/Relay" -type f \( -name "*.node" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' f; do
     echo "Signing gateway payload: $f"; sign_item "$f" "$ENT_TMP_BASE"
   done
-  if [ -f "$APP_BUNDLE/Contents/Resources/Relay/clawdis-gateway" ]; then
-    echo "Signing embedded gateway"; sign_item "$APP_BUNDLE/Contents/Resources/Relay/clawdis-gateway" "$ENT_TMP_BUN"
-  fi
   if [ -f "$APP_BUNDLE/Contents/Resources/Relay/clawdis" ]; then
-    echo "Signing embedded CLI"; sign_item "$APP_BUNDLE/Contents/Resources/Relay/clawdis" "$ENT_TMP_BUN"
+    echo "Signing embedded relay"; sign_item "$APP_BUNDLE/Contents/Resources/Relay/clawdis" "$ENT_TMP_BUN"
   fi
 fi
 

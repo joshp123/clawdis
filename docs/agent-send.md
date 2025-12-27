@@ -11,8 +11,8 @@ read_when:
 - Required: `--message <text>`
 - Session selection:
   - If `--session-id` is given, reuse it.
-  - Else if `--to <e164>` is given, derive the session key from `inbound.session.scope` (direct chats collapse to `inbound.session.mainKey`).
-- Runs the embedded Pi agent (configured via `inbound.agent`).
+  - Else if `--to <e164>` is given, derive the session key from `session.scope` (direct chats collapse to `session.mainKey`).
+- Runs the embedded Pi agent (configured via `agent`).
 - Thinking/verbose:
   - Flags `--thinking <off|minimal|low|medium|high>` and `--verbose <on|off>` persist into the session store.
 - Output:

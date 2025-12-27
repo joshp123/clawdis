@@ -1,3 +1,4 @@
+import ClawdisKit
 import Foundation
 import SwiftUI
 
@@ -6,12 +7,139 @@ private enum ChatUIConstants {
     static let bubbleCorner: CGFloat = 18
 }
 
+private struct ChatBubbleShape: InsettableShape {
+    enum Tail {
+        case left
+        case right
+        case none
+    }
+
+    let cornerRadius: CGFloat
+    let tail: Tail
+    var insetAmount: CGFloat = 0
+
+    private let tailWidth: CGFloat = 7
+    private let tailBaseHeight: CGFloat = 9
+
+    func inset(by amount: CGFloat) -> ChatBubbleShape {
+        var copy = self
+        copy.insetAmount += amount
+        return copy
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let rect = rect.insetBy(dx: self.insetAmount, dy: self.insetAmount)
+        switch self.tail {
+        case .left:
+            return self.leftTailPath(in: rect, radius: self.cornerRadius)
+        case .right:
+            return self.rightTailPath(in: rect, radius: self.cornerRadius)
+        case .none:
+            return Path(roundedRect: rect, cornerRadius: self.cornerRadius)
+        }
+    }
+
+    private func rightTailPath(in rect: CGRect, radius r: CGFloat) -> Path {
+        var path = Path()
+        let bubbleMinX = rect.minX
+        let bubbleMaxX = rect.maxX - self.tailWidth
+        let bubbleMinY = rect.minY
+        let bubbleMaxY = rect.maxY
+
+        let available = max(4, bubbleMaxY - bubbleMinY - 2 * r)
+        let baseH = min(tailBaseHeight, available)
+        let baseBottomY = bubbleMaxY - max(r * 0.45, 6)
+        let baseTopY = baseBottomY - baseH
+        let midY = (baseTopY + baseBottomY) / 2
+
+        let baseTop = CGPoint(x: bubbleMaxX, y: baseTopY)
+        let baseBottom = CGPoint(x: bubbleMaxX, y: baseBottomY)
+        let tip = CGPoint(x: bubbleMaxX + self.tailWidth, y: midY)
+
+        path.move(to: CGPoint(x: bubbleMinX + r, y: bubbleMinY))
+        path.addLine(to: CGPoint(x: bubbleMaxX - r, y: bubbleMinY))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMaxX, y: bubbleMinY + r),
+            control: CGPoint(x: bubbleMaxX, y: bubbleMinY))
+        path.addLine(to: baseTop)
+        path.addCurve(
+            to: tip,
+            control1: CGPoint(x: bubbleMaxX + self.tailWidth * 0.2, y: baseTopY + baseH * 0.05),
+            control2: CGPoint(x: bubbleMaxX + self.tailWidth * 0.95, y: midY - baseH * 0.15))
+        path.addCurve(
+            to: baseBottom,
+            control1: CGPoint(x: bubbleMaxX + self.tailWidth * 0.95, y: midY + baseH * 0.15),
+            control2: CGPoint(x: bubbleMaxX + self.tailWidth * 0.2, y: baseBottomY - baseH * 0.05))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMaxX - r, y: bubbleMaxY),
+            control: CGPoint(x: bubbleMaxX, y: bubbleMaxY))
+        path.addLine(to: CGPoint(x: bubbleMinX + r, y: bubbleMaxY))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMinX, y: bubbleMaxY - r),
+            control: CGPoint(x: bubbleMinX, y: bubbleMaxY))
+        path.addLine(to: CGPoint(x: bubbleMinX, y: bubbleMinY + r))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMinX + r, y: bubbleMinY),
+            control: CGPoint(x: bubbleMinX, y: bubbleMinY))
+
+        return path
+    }
+
+    private func leftTailPath(in rect: CGRect, radius r: CGFloat) -> Path {
+        var path = Path()
+        let bubbleMinX = rect.minX + self.tailWidth
+        let bubbleMaxX = rect.maxX
+        let bubbleMinY = rect.minY
+        let bubbleMaxY = rect.maxY
+
+        let available = max(4, bubbleMaxY - bubbleMinY - 2 * r)
+        let baseH = min(tailBaseHeight, available)
+        let baseBottomY = bubbleMaxY - max(r * 0.45, 6)
+        let baseTopY = baseBottomY - baseH
+        let midY = (baseTopY + baseBottomY) / 2
+
+        let baseTop = CGPoint(x: bubbleMinX, y: baseTopY)
+        let baseBottom = CGPoint(x: bubbleMinX, y: baseBottomY)
+        let tip = CGPoint(x: bubbleMinX - self.tailWidth, y: midY)
+
+        path.move(to: CGPoint(x: bubbleMinX + r, y: bubbleMinY))
+        path.addLine(to: CGPoint(x: bubbleMaxX - r, y: bubbleMinY))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMaxX, y: bubbleMinY + r),
+            control: CGPoint(x: bubbleMaxX, y: bubbleMinY))
+        path.addLine(to: CGPoint(x: bubbleMaxX, y: bubbleMaxY - r))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMaxX - r, y: bubbleMaxY),
+            control: CGPoint(x: bubbleMaxX, y: bubbleMaxY))
+        path.addLine(to: CGPoint(x: bubbleMinX + r, y: bubbleMaxY))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMinX, y: bubbleMaxY - r),
+            control: CGPoint(x: bubbleMinX, y: bubbleMaxY))
+        path.addLine(to: baseBottom)
+        path.addCurve(
+            to: tip,
+            control1: CGPoint(x: bubbleMinX - self.tailWidth * 0.2, y: baseBottomY - baseH * 0.05),
+            control2: CGPoint(x: bubbleMinX - self.tailWidth * 0.95, y: midY + baseH * 0.15))
+        path.addCurve(
+            to: baseTop,
+            control1: CGPoint(x: bubbleMinX - self.tailWidth * 0.95, y: midY - baseH * 0.15),
+            control2: CGPoint(x: bubbleMinX - self.tailWidth * 0.2, y: baseTopY + baseH * 0.05))
+        path.addLine(to: CGPoint(x: bubbleMinX, y: bubbleMinY + r))
+        path.addQuadCurve(
+            to: CGPoint(x: bubbleMinX + r, y: bubbleMinY),
+            control: CGPoint(x: bubbleMinX, y: bubbleMinY))
+
+        return path
+    }
+}
+
 @MainActor
 struct ChatMessageBubble: View {
     let message: ClawdisChatMessage
+    let style: ClawdisChatView.Style
 
     var body: some View {
-        ChatMessageBody(message: self.message, isUser: self.isUser)
+        ChatMessageBody(message: self.message, isUser: self.isUser, style: self.style)
             .frame(maxWidth: ChatUIConstants.bubbleMaxWidth, alignment: self.isUser ? .trailing : .leading)
             .frame(maxWidth: .infinity, alignment: self.isUser ? .trailing : .leading)
             .padding(.horizontal, 2)
@@ -24,6 +152,7 @@ struct ChatMessageBubble: View {
 private struct ChatMessageBody: View {
     let message: ClawdisChatMessage
     let isUser: Bool
+    let style: ClawdisChatView.Style
 
     var body: some View {
         let text = self.primaryText
@@ -31,12 +160,21 @@ private struct ChatMessageBody: View {
         let textColor = self.isUser ? ClawdisChatTheme.userText : ClawdisChatTheme.assistantText
 
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(split.blocks) { block in
-                switch block.kind {
-                case .text:
-                    MarkdownTextView(text: block.text, textColor: textColor)
-                case let .code(language):
-                    CodeBlockView(code: block.text, language: language, isUser: self.isUser)
+            if self.isToolResultMessage {
+                if !text.isEmpty {
+                    ToolResultCard(
+                        title: self.toolResultTitle,
+                        text: text,
+                        isUser: self.isUser)
+                }
+            } else {
+                ForEach(split.blocks) { block in
+                    switch block.kind {
+                    case .text:
+                        MarkdownTextView(text: block.text, textColor: textColor)
+                    case let .code(language):
+                        CodeBlockView(code: block.text, language: language, isUser: self.isUser)
+                    }
                 }
             }
 
@@ -67,35 +205,147 @@ private struct ChatMessageBody: View {
                     AttachmentRow(att: self.inlineAttachments[idx], isUser: self.isUser)
                 }
             }
+
+            if !self.toolCalls.isEmpty {
+                ForEach(self.toolCalls.indices, id: \.self) { idx in
+                    ToolCallCard(
+                        content: self.toolCalls[idx],
+                        isUser: self.isUser)
+                }
+            }
+
+            if !self.inlineToolResults.isEmpty {
+                ForEach(self.inlineToolResults.indices, id: \.self) { idx in
+                    let toolResult = self.inlineToolResults[idx]
+                    ToolResultCard(
+                        title: toolResult.name ?? "Tool result",
+                        text: toolResult.text ?? "",
+                        isUser: self.isUser)
+                }
+            }
         }
         .textSelection(.enabled)
         .padding(.vertical, 10)
         .padding(.horizontal, 12)
         .foregroundStyle(textColor)
         .background(self.bubbleBackground)
+        .clipShape(self.bubbleShape)
         .overlay(self.bubbleBorder)
-        .clipShape(RoundedRectangle(cornerRadius: ChatUIConstants.bubbleCorner, style: .continuous))
+        .shadow(color: self.bubbleShadowColor, radius: self.bubbleShadowRadius, y: self.bubbleShadowYOffset)
+        .padding(.leading, self.tailPaddingLeading)
+        .padding(.trailing, self.tailPaddingTrailing)
     }
 
     private var primaryText: String {
-        let parts = self.message.content.compactMap(\.text)
+        let parts = self.message.content.compactMap { content -> String? in
+            let kind = (content.type ?? "text").lowercased()
+            guard kind == "text" || kind.isEmpty else { return nil }
+            return content.text
+        }
         return parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private var inlineAttachments: [ClawdisChatMessageContent] {
-        self.message.content.filter { ($0.type ?? "text") != "text" }
+        self.message.content.filter { content in
+            switch content.type ?? "text" {
+            case "file", "attachment":
+                true
+            default:
+                false
+            }
+        }
+    }
+
+    private var toolCalls: [ClawdisChatMessageContent] {
+        self.message.content.filter { content in
+            let kind = (content.type ?? "").lowercased()
+            if ["toolcall", "tool_call", "tooluse", "tool_use"].contains(kind) {
+                return true
+            }
+            return content.name != nil && content.arguments != nil
+        }
+    }
+
+    private var inlineToolResults: [ClawdisChatMessageContent] {
+        self.message.content.filter { content in
+            let kind = (content.type ?? "").lowercased()
+            return kind == "toolresult" || kind == "tool_result"
+        }
+    }
+
+    private var isToolResultMessage: Bool {
+        let role = self.message.role.lowercased()
+        return role == "toolresult" || role == "tool_result"
+    }
+
+    private var toolResultTitle: String {
+        if let name = self.message.toolName, !name.isEmpty {
+            return name
+        }
+        return "Tool result"
+    }
+
+    private var bubbleFillColor: Color {
+        if self.isUser {
+            return ClawdisChatTheme.userBubble
+        }
+        if self.style == .onboarding {
+            return ClawdisChatTheme.onboardingAssistantBubble
+        }
+        return ClawdisChatTheme.assistantBubble
     }
 
     private var bubbleBackground: AnyShapeStyle {
-        let fill = self.isUser ? ClawdisChatTheme.userBubble : ClawdisChatTheme.assistantBubble
-        return AnyShapeStyle(fill)
+        AnyShapeStyle(self.bubbleFillColor)
+    }
+
+    private var bubbleBorderColor: Color {
+        if self.isUser {
+            return Color.white.opacity(0.12)
+        }
+        if self.style == .onboarding {
+            return ClawdisChatTheme.onboardingAssistantBorder
+        }
+        return Color.white.opacity(0.08)
+    }
+
+    private var bubbleBorderWidth: CGFloat {
+        if self.isUser { return 0.5 }
+        if self.style == .onboarding { return 0.8 }
+        return 1
     }
 
     private var bubbleBorder: some View {
-        RoundedRectangle(cornerRadius: ChatUIConstants.bubbleCorner, style: .continuous)
-            .strokeBorder(
-                self.isUser ? Color.white.opacity(0.12) : Color.black.opacity(0.08),
-                lineWidth: self.isUser ? 0.5 : 1)
+        self.bubbleShape.strokeBorder(self.bubbleBorderColor, lineWidth: self.bubbleBorderWidth)
+    }
+
+    private var bubbleShape: ChatBubbleShape {
+        ChatBubbleShape(cornerRadius: ChatUIConstants.bubbleCorner, tail: self.bubbleTail)
+    }
+
+    private var bubbleTail: ChatBubbleShape.Tail {
+        guard self.style == .onboarding else { return .none }
+        return self.isUser ? .right : .left
+    }
+
+    private var tailPaddingLeading: CGFloat {
+        self.style == .onboarding && !self.isUser ? 8 : 0
+    }
+
+    private var tailPaddingTrailing: CGFloat {
+        self.style == .onboarding && self.isUser ? 8 : 0
+    }
+
+    private var bubbleShadowColor: Color {
+        self.style == .onboarding && !self.isUser ? Color.black.opacity(0.28) : .clear
+    }
+
+    private var bubbleShadowRadius: CGFloat {
+        self.style == .onboarding && !self.isUser ? 6 : 0
+    }
+
+    private var bubbleShadowYOffset: CGFloat {
+        self.style == .onboarding && !self.isUser ? 2 : 0
     }
 }
 
@@ -118,24 +368,169 @@ private struct AttachmentRow: View {
     }
 }
 
+private struct ToolCallCard: View {
+    let content: ClawdisChatMessageContent
+    let isUser: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "hammer")
+                    .imageScale(.small)
+                Text(self.toolName)
+                    .font(.footnote.weight(.semibold))
+                Spacer(minLength: 0)
+            }
+
+            if let summary = self.summary, !summary.isEmpty {
+                Text(summary)
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(ClawdisChatTheme.subtleCard)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)))
+    }
+
+    private var toolName: String {
+        self.content.name?.isEmpty == false ? (self.content.name ?? "Tool") : "Tool"
+    }
+
+    private var summary: String? {
+        guard let args = self.content.arguments else { return nil }
+        if let dict = args.value as? [String: AnyCodable] {
+            if let command = dict["command"]?.value as? String { return command }
+            if let path = dict["path"]?.value as? String { return path }
+            if let pattern = dict["pattern"]?.value as? String { return pattern }
+            if let query = dict["query"]?.value as? String { return query }
+            if let url = dict["url"]?.value as? String { return url }
+            return Self.renderArgs(dict)
+        }
+        return Self.renderValue(args)
+    }
+
+    private static func renderArgs(_ dict: [String: AnyCodable]) -> String? {
+        let keys = dict.keys.sorted()
+        let pairs = keys.prefix(6).compactMap { key -> String? in
+            guard let value = dict[key] else { return nil }
+            return "\(key)=\(self.renderValue(value) ?? "…")"
+        }
+        guard !pairs.isEmpty else { return nil }
+        return pairs.joined(separator: " ")
+    }
+
+    private static func renderValue(_ value: AnyCodable) -> String? {
+        switch value.value {
+        case let str as String:
+            return str
+        case let num as Int:
+            return String(num)
+        case let num as Double:
+            return String(num)
+        case let bool as Bool:
+            return bool ? "true" : "false"
+        default:
+            if let data = try? JSONEncoder().encode(value),
+               let string = String(data: data, encoding: .utf8)
+            {
+                return string
+            }
+            return nil
+        }
+    }
+}
+
+private struct ToolResultCard: View {
+    let title: String
+    let text: String
+    let isUser: Bool
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal")
+                    .imageScale(.small)
+                Text(self.title)
+                    .font(.footnote.weight(.semibold))
+                Spacer(minLength: 0)
+            }
+
+            Text(self.displayText)
+                .font(.footnote.monospaced())
+                .foregroundStyle(self.isUser ? ClawdisChatTheme.userText : ClawdisChatTheme.assistantText)
+                .lineLimit(self.expanded ? nil : Self.previewLineLimit)
+
+            if self.shouldShowToggle {
+                Button(self.expanded ? "Show less" : "Show full output") {
+                    self.expanded.toggle()
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(ClawdisChatTheme.subtleCard)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)))
+    }
+
+    private static let previewLineLimit = 8
+
+    private var lines: [Substring] {
+        self.text.components(separatedBy: .newlines).map { Substring($0) }
+    }
+
+    private var displayText: String {
+        guard !self.expanded, self.lines.count > Self.previewLineLimit else { return self.text }
+        return self.lines.prefix(Self.previewLineLimit).joined(separator: "\n") + "\n…"
+    }
+
+    private var shouldShowToggle: Bool {
+        self.lines.count > Self.previewLineLimit
+    }
+}
+
 @MainActor
 struct ChatTypingIndicatorBubble: View {
+    let style: ClawdisChatView.Style
+
     var body: some View {
         HStack(spacing: 10) {
             TypingDots()
-            Text("Clawd is thinking…")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Spacer()
+            if self.style == .standard {
+                Text("Clawd is thinking…")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
         }
-        .padding(12)
+        .padding(.vertical, self.style == .standard ? 12 : 10)
+        .padding(.horizontal, self.style == .standard ? 12 : 14)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(ClawdisChatTheme.assistantBubble))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.black.opacity(0.08), lineWidth: 1))
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
         .frame(maxWidth: ChatUIConstants.bubbleMaxWidth, alignment: .leading)
+        .focusable(false)
+    }
+}
+
+extension ChatTypingIndicatorBubble: @MainActor Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.style == rhs.style
     }
 }
 
@@ -153,8 +548,9 @@ struct ChatStreamingAssistantBubble: View {
                 .fill(ClawdisChatTheme.assistantBubble))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.black.opacity(0.08), lineWidth: 1))
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
         .frame(maxWidth: ChatUIConstants.bubbleMaxWidth, alignment: .leading)
+        .focusable(false)
     }
 }
 
@@ -187,14 +583,22 @@ struct ChatPendingToolsBubble: View {
                 .fill(ClawdisChatTheme.assistantBubble))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.black.opacity(0.08), lineWidth: 1))
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
         .frame(maxWidth: ChatUIConstants.bubbleMaxWidth, alignment: .leading)
+        .focusable(false)
+    }
+}
+
+extension ChatPendingToolsBubble: @MainActor Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.toolCalls == rhs.toolCalls
     }
 }
 
 @MainActor
 private struct TypingDots: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
     @State private var animate = false
 
     var body: some View {
@@ -212,10 +616,22 @@ private struct TypingDots: View {
                         value: self.animate)
             }
         }
-        .onAppear {
-            guard !self.reduceMotion else { return }
-            self.animate = true
+        .onAppear { self.updateAnimationState() }
+        .onDisappear { self.animate = false }
+        .onChange(of: self.scenePhase) { _, _ in
+            self.updateAnimationState()
         }
+        .onChange(of: self.reduceMotion) { _, _ in
+            self.updateAnimationState()
+        }
+    }
+
+    private func updateAnimationState() {
+        guard !self.reduceMotion, self.scenePhase == .active else {
+            self.animate = false
+            return
+        }
+        self.animate = true
     }
 }
 
@@ -225,12 +641,18 @@ private struct MarkdownTextView: View {
     let textColor: Color
 
     var body: some View {
-        if let attributed = try? AttributedString(markdown: self.text) {
+        let normalized = self.text.replacingOccurrences(
+            of: "(?<!\\n)\\n(?!\\n)",
+            with: " ",
+            options: .regularExpression)
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        if let attributed = try? AttributedString(markdown: normalized, options: options) {
             Text(attributed)
                 .font(.system(size: 14))
                 .foregroundStyle(self.textColor)
         } else {
-            Text(self.text)
+            Text(normalized)
                 .font(.system(size: 14))
                 .foregroundStyle(self.textColor)
         }

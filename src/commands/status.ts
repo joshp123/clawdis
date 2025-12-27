@@ -1,5 +1,10 @@
 import { lookupContextTokens } from "../agents/context.js";
-import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL } from "../agents/defaults.js";
+import {
+  DEFAULT_CONTEXT_TOKENS,
+  DEFAULT_MODEL,
+  DEFAULT_PROVIDER,
+} from "../agents/defaults.js";
+import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import { loadConfig } from "../config/config.js";
 import {
   loadSessionStore,
@@ -29,7 +34,6 @@ export type SessionStatus = {
   verboseLevel?: string;
   systemSent?: boolean;
   abortedLastRun?: boolean;
-  syncing?: boolean | string;
   inputTokens?: number;
   outputTokens?: number;
   totalTokens: number | null;
@@ -61,13 +65,18 @@ export async function getStatusSummary(): Promise<StatusSummary> {
   const providerSummary = await buildProviderSummary(cfg);
   const queuedSystemEvents = peekSystemEvents();
 
-  const configModel = cfg.inbound?.agent?.model ?? DEFAULT_MODEL;
+  const resolved = resolveConfiguredModelRef({
+    cfg,
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
+  const configModel = resolved.model ?? DEFAULT_MODEL;
   const configContextTokens =
-    cfg.inbound?.agent?.contextTokens ??
+    cfg.agent?.contextTokens ??
     lookupContextTokens(configModel) ??
     DEFAULT_CONTEXT_TOKENS;
 
-  const storePath = resolveStorePath(cfg.inbound?.session?.store);
+  const storePath = resolveStorePath(cfg.session?.store);
   const store = loadSessionStore(storePath);
   const now = Date.now();
   const sessions = Object.entries(store)
@@ -101,7 +110,6 @@ export async function getStatusSummary(): Promise<StatusSummary> {
         verboseLevel: entry?.verboseLevel,
         systemSent: entry?.systemSent,
         abortedLastRun: entry?.abortedLastRun,
-        syncing: entry?.syncing,
         inputTokens: entry?.inputTokens,
         outputTokens: entry?.outputTokens,
         totalTokens: total ?? null,
@@ -178,10 +186,6 @@ const buildFlags = (entry: SessionEntry): string[] => {
     flags.push(`verbose:${verbose}`);
   if (entry?.systemSent) flags.push("system");
   if (entry?.abortedLastRun) flags.push("aborted");
-  const syncing = entry?.syncing as unknown;
-  if (syncing === true || syncing === "on") flags.push("syncing");
-  else if (typeof syncing === "string" && syncing)
-    flags.push(`sync:${syncing}`);
   const sessionId = entry?.sessionId as unknown;
   if (typeof sessionId === "string" && sessionId.length > 0)
     flags.push(`id:${sessionId}`);
@@ -231,6 +235,15 @@ export async function statusCommand(
         : `Telegram: failed (${health.telegram.probe?.status ?? "unknown"})${health.telegram.probe?.error ? ` - ${health.telegram.probe.error}` : ""}`
       : info("Telegram: not configured");
     runtime.log(tgLine);
+
+    const discordLine = health.discord.configured
+      ? health.discord.probe?.ok
+        ? info(
+            `Discord: ok${health.discord.probe.bot?.username ? ` (@${health.discord.probe.bot.username})` : ""} (${health.discord.probe.elapsedMs}ms)`,
+          )
+        : `Discord: failed (${health.discord.probe?.status ?? "unknown"})${health.discord.probe?.error ? ` - ${health.discord.probe.error}` : ""}`
+      : info("Discord: not configured");
+    runtime.log(discordLine);
   } else {
     runtime.log(info("Provider probes: skipped (use --deep)"));
   }

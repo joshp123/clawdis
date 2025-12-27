@@ -1,3 +1,10 @@
+---
+summary: "Logging surfaces, file logs, WS log styles, and console formatting"
+read_when:
+  - Changing logging output or formats
+  - Debugging CLI or gateway output
+---
+
 # Logging
 
 Clawdis has two log “surfaces”:
@@ -53,3 +60,27 @@ clawdis gateway --verbose --ws-log compact
 # show all WS traffic (full meta)
 clawdis gateway --verbose --ws-log full
 ```
+
+## Console formatting (subsystem logging)
+
+Clawdis formats console logs via a small wrapper on top of the existing stack:
+
+- **tslog** for structured file logs (`src/logging.ts`)
+- **chalk** for colors (`src/globals.ts`)
+
+The console formatter is **TTY-aware** and prints consistent, prefixed lines.
+Subsystem loggers are created via `createSubsystemLogger("gateway")`.
+
+Behavior:
+
+- **Subsystem prefixes** on every line (e.g. `[gateway]`, `[canvas]`, `[tailscale]`)
+- **Subsystem colors** (stable per subsystem) plus level coloring
+- **Color when output is a TTY or the environment looks like a rich terminal** (`TERM`/`COLORTERM`/`TERM_PROGRAM`), respects `NO_COLOR`
+- **Shortened subsystem prefixes**: drops leading `gateway/` + `providers/`, keeps last 2 segments (e.g. `whatsapp/outbound`)
+- **Sub-loggers by subsystem** (auto prefix + structured field `{ subsystem }`)
+- **`logRaw()`** for QR/UX output (no prefix, no formatting)
+- **Console styles** (e.g. `pretty | compact | json`)
+- **Console log level** separate from file log level (file keeps full detail)
+- **WhatsApp message bodies** are logged at `debug` (use `--verbose` to see them)
+
+This keeps existing file logs stable while making interactive output scannable.

@@ -29,7 +29,8 @@ function createPage(opts: {
 
   const click = vi.fn().mockResolvedValue(undefined);
   const dblclick = vi.fn().mockResolvedValue(undefined);
-  const locator = vi.fn().mockReturnValue({ click, dblclick });
+  const fill = vi.fn().mockResolvedValue(undefined);
+  const locator = vi.fn().mockReturnValue({ click, dblclick, fill });
 
   const page = {
     context: () => context,
@@ -44,7 +45,7 @@ function createPage(opts: {
         }),
   };
 
-  return { page, session, locator, click };
+  return { page, session, locator, click, fill };
 }
 
 function createBrowser(pages: unknown[]) {
@@ -128,9 +129,7 @@ describe("pw-ai", () => {
     const { chromium } = await import("playwright-core");
     const p1 = createPage({ targetId: "T1", snapshotFull: "ONE" });
     const browser = createBrowser([p1.page]);
-    const connect = chromium.connectOverCDP as unknown as ReturnType<
-      typeof vi.fn
-    >;
+    const connect = vi.spyOn(chromium, "connectOverCDP");
     connect.mockResolvedValue(browser);
 
     const mod = await importModule();

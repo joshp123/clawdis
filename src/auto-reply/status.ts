@@ -2,7 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 
 import { lookupContextTokens } from "../agents/context.js";
-import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL } from "../agents/defaults.js";
+import {
+  DEFAULT_CONTEXT_TOKENS,
+  DEFAULT_MODEL,
+  DEFAULT_PROVIDER,
+} from "../agents/defaults.js";
+import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import {
   derivePromptTokens,
   normalizeUsage,
@@ -16,7 +21,7 @@ import {
 } from "../config/sessions.js";
 import type { ThinkLevel, VerboseLevel } from "./thinking.js";
 
-type AgentConfig = NonNullable<ClawdisConfig["inbound"]>["agent"];
+type AgentConfig = NonNullable<ClawdisConfig["agent"]>;
 
 type StatusArgs = {
   agent: AgentConfig;
@@ -129,7 +134,12 @@ const readUsageFromSessionLog = (
 export function buildStatusMessage(args: StatusArgs): string {
   const now = args.now ?? Date.now();
   const entry = args.sessionEntry;
-  let model = entry?.model ?? args.agent?.model ?? DEFAULT_MODEL;
+  const resolved = resolveConfiguredModelRef({
+    cfg: { agent: args.agent ?? {} },
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
+  let model = entry?.model ?? resolved.model ?? DEFAULT_MODEL;
   let contextTokens =
     entry?.contextTokens ??
     args.agent?.contextTokens ??
@@ -181,18 +191,18 @@ export function buildStatusMessage(args: StatusArgs): string {
     .filter(Boolean)
     .join(" • ");
 
+  const groupActivationLine = args.sessionKey?.startsWith("group:")
+    ? `Group activation: ${entry?.groupActivation ?? "mention"}`
+    : undefined;
+
   const contextLine = `Context: ${formatTokens(
     totalTokens,
     contextTokens ?? null,
   )}${entry?.abortedLastRun ? " • last run aborted" : ""}`;
 
-  const optionsLine = `Options: thinking=${thinkLevel} | verbose=${verboseLevel} (set with /think <level>, /verbose on|off)`;
+  const optionsLine = `Options: thinking=${thinkLevel} | verbose=${verboseLevel} (set with /think <level>, /verbose on|off, /model <id>)`;
 
-  const modelLabel = args.agent?.provider?.trim()
-    ? `${args.agent.provider}/${args.agent?.model ?? model}`
-    : model
-      ? model
-      : "unknown";
+  const modelLabel = model ? `${resolved.provider}/${model}` : "unknown";
 
   const agentLine = `Agent: embedded pi • ${modelLabel}`;
 
@@ -209,6 +219,7 @@ export function buildStatusMessage(args: StatusArgs): string {
     workspaceLine,
     contextLine,
     sessionLine,
+    groupActivationLine,
     optionsLine,
     helpersLine,
   ].join("\n");

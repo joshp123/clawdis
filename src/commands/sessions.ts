@@ -1,7 +1,12 @@
 import chalk from "chalk";
 
 import { lookupContextTokens } from "../agents/context.js";
-import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL } from "../agents/defaults.js";
+import {
+  DEFAULT_CONTEXT_TOKENS,
+  DEFAULT_MODEL,
+  DEFAULT_PROVIDER,
+} from "../agents/defaults.js";
+import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import { loadConfig } from "../config/config.js";
 import {
   loadSessionStore,
@@ -21,6 +26,7 @@ type SessionRow = {
   abortedLastRun?: boolean;
   thinkingLevel?: string;
   verboseLevel?: string;
+  groupActivation?: string;
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
@@ -93,6 +99,7 @@ const formatFlagsCell = (row: SessionRow, rich: boolean) => {
   const flags = [
     row.thinkingLevel ? `think:${row.thinkingLevel}` : null,
     row.verboseLevel ? `verbose:${row.verboseLevel}` : null,
+    row.groupActivation ? `activation:${row.groupActivation}` : null,
     row.systemSent ? "system" : null,
     row.abortedLastRun ? "aborted" : null,
     row.sessionId ? `id:${row.sessionId}` : null,
@@ -133,6 +140,7 @@ function toRows(store: Record<string, SessionEntry>): SessionRow[] {
         abortedLastRun: entry?.abortedLastRun,
         thinkingLevel: entry?.thinkingLevel,
         verboseLevel: entry?.verboseLevel,
+        groupActivation: entry?.groupActivation,
         inputTokens: entry?.inputTokens,
         outputTokens: entry?.outputTokens,
         totalTokens: entry?.totalTokens,
@@ -148,12 +156,17 @@ export async function sessionsCommand(
   runtime: RuntimeEnv,
 ) {
   const cfg = loadConfig();
+  const resolved = resolveConfiguredModelRef({
+    cfg,
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
   const configContextTokens =
-    cfg.inbound?.agent?.contextTokens ??
-    lookupContextTokens(cfg.inbound?.agent?.model) ??
+    cfg.agent?.contextTokens ??
+    lookupContextTokens(resolved.model) ??
     DEFAULT_CONTEXT_TOKENS;
-  const configModel = cfg.inbound?.agent?.model ?? DEFAULT_MODEL;
-  const storePath = resolveStorePath(opts.store ?? cfg.inbound?.session?.store);
+  const configModel = resolved.model ?? DEFAULT_MODEL;
+  const storePath = resolveStorePath(opts.store ?? cfg.session?.store);
   const store = loadSessionStore(storePath);
 
   let activeMinutes: number | undefined;

@@ -23,6 +23,8 @@ struct DebugSettings: View {
     @State private var portCheckInFlight = false
     @State private var portReports: [DebugActions.PortReport] = []
     @State private var portKillStatus: String?
+    @State private var tunnelResetInFlight = false
+    @State private var tunnelResetStatus: String?
     @State private var pendingKill: DebugActions.PortListener?
     @AppStorage(attachExistingGatewayOnlyKey) private var attachExistingGatewayOnly: Bool = false
     @AppStorage(debugFileLogEnabledKey) private var diagnosticsFileLogEnabled: Bool = false
@@ -264,10 +266,21 @@ struct DebugSettings: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(self.portCheckInFlight)
+                    Button("Reset SSH tunnel") {
+                        Task { await self.resetGatewayTunnel() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(self.tunnelResetInFlight || !self.isRemoteMode)
                 }
 
                 if let portKillStatus {
                     Text(portKillStatus)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let tunnelResetStatus {
+                    Text(tunnelResetStatus)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -404,7 +417,7 @@ struct DebugSettings: View {
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
                             }
-                            Text("Used by the Config tab model picker; point at a different build when debugging.")
+                            Text("Local fallback for model picker when gateway models.list is unavailable.")
                                 .font(.footnote)
                                 .foregroundStyle(.tertiary)
                         }
@@ -594,6 +607,21 @@ struct DebugSettings: View {
     }
 
     @MainActor
+    private func resetGatewayTunnel() async {
+        self.tunnelResetInFlight = true
+        self.tunnelResetStatus = nil
+        let result = await DebugActions.resetGatewayTunnel()
+        switch result {
+        case let .success(message):
+            self.tunnelResetStatus = message
+        case let .failure(err):
+            self.tunnelResetStatus = err.localizedDescription
+        }
+        await self.runPortCheck()
+        self.tunnelResetInFlight = false
+    }
+
+    @MainActor
     private func requestKill(_ listener: DebugActions.PortListener) {
         if listener.expected {
             self.pendingKill = listener
@@ -681,9 +709,7 @@ struct DebugSettings: View {
         guard
             let data = try? Data(contentsOf: url),
             let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let inbound = parsed["inbound"] as? [String: Any],
-            let reply = inbound["reply"] as? [String: Any],
-            let session = reply["session"] as? [String: Any],
+            let session = parsed["session"] as? [String: Any],
             let path = session["store"] as? String
         else {
             self.sessionStorePath = SessionLoader.defaultStorePath
@@ -702,13 +728,9 @@ struct DebugSettings: View {
             root = parsed
         }
 
-        var inbound = root["inbound"] as? [String: Any] ?? [:]
-        var reply = inbound["reply"] as? [String: Any] ?? [:]
-        var session = reply["session"] as? [String: Any] ?? [:]
+        var session = root["session"] as? [String: Any] ?? [:]
         session["store"] = trimmed.isEmpty ? SessionLoader.defaultStorePath : trimmed
-        reply["session"] = session
-        inbound["reply"] = reply
-        root["inbound"] = inbound
+        root["session"] = session
 
         do {
             let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
@@ -734,6 +756,10 @@ struct DebugSettings: View {
                 }
             }
         }
+    }
+
+    private var isRemoteMode: Bool {
+        CommandResolver.connectionSettings().mode == .remote
     }
 
     private func configURL() -> URL {
@@ -878,6 +904,58 @@ struct DebugSettings_Previews: PreviewProvider {
     static var previews: some View {
         DebugSettings()
             .frame(width: SettingsTab.windowWidth, height: SettingsTab.windowHeight)
+    }
+}
+
+@MainActor
+extension DebugSettings {
+    static func exerciseForTesting() async {
+        let view = DebugSettings()
+        view.modelsCount = 3
+        view.modelsLoading = false
+        view.modelsError = "Failed to load models"
+        view.gatewayRootInput = "/tmp/clawdis"
+        view.sessionStorePath = "/tmp/sessions.json"
+        view.sessionStoreSaveError = "Save failed"
+        view.debugSendInFlight = true
+        view.debugSendStatus = "Sent"
+        view.debugSendError = "Failed"
+        view.portCheckInFlight = true
+        view.portReports = [
+            DebugActions.PortReport(
+                port: 18789,
+                expected: "Gateway websocket (node/tsx)",
+                status: .missing("Missing"),
+                listeners: []),
+        ]
+        view.portKillStatus = "Killed"
+        view.pendingKill = DebugActions.PortListener(
+            pid: 1,
+            command: "node",
+            fullCommand: "node",
+            user: nil,
+            expected: true)
+        view.canvasSessionKey = "main"
+        view.canvasStatus = "Canvas ok"
+        view.canvasError = "Canvas error"
+        view.canvasEvalJS = "document.title"
+        view.canvasEvalResult = "Canvas"
+        view.canvasSnapshotPath = "/tmp/snapshot.png"
+
+        _ = view.body
+        _ = view.header
+        _ = view.appInfoSection
+        _ = view.gatewaySection
+        _ = view.logsSection
+        _ = view.portsSection
+        _ = view.pathsSection
+        _ = view.quickActionsSection
+        _ = view.canvasSection
+        _ = view.experimentsSection
+        _ = view.gridLabel("Test")
+
+        view.loadSessionStorePath()
+        await view.reloadModels()
     }
 }
 #endif

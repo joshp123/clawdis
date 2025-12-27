@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => ({
       model: "pi:opus",
       sessionId: "abc123",
       systemSent: true,
-      syncing: true,
     },
   }),
   resolveStorePath: vi.fn().mockReturnValue("/tmp/sessions.json"),
@@ -33,7 +32,7 @@ vi.mock("../web/session.js", () => ({
   logWebSelfId: mocks.logWebSelfId,
 }));
 vi.mock("../config/config.js", () => ({
-  loadConfig: () => ({ inbound: { reply: { session: {} } } }),
+  loadConfig: () => ({ session: {} }),
 }));
 
 import { statusCommand } from "./status.js";
@@ -56,7 +55,6 @@ describe("statusCommand", () => {
     expect(payload.sessions.recent[0].percentUsed).toBe(50);
     expect(payload.sessions.recent[0].remainingTokens).toBe(5000);
     expect(payload.sessions.recent[0].flags).toContain("verbose:on");
-    expect(payload.sessions.recent[0].flags).toContain("syncing");
   });
 
   it("prints formatted lines otherwise", async () => {

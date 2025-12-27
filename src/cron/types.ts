@@ -14,7 +14,7 @@ export type CronPayload =
       thinking?: string;
       timeoutSeconds?: number;
       deliver?: boolean;
-      channel?: "last" | "whatsapp" | "telegram";
+      channel?: "last" | "whatsapp" | "telegram" | "discord";
       to?: string;
       bestEffortDeliver?: boolean;
     };
@@ -34,7 +34,8 @@ export type CronJobState = {
 
 export type CronJob = {
   id: string;
-  name?: string;
+  name: string;
+  description?: string;
   enabled: boolean;
   createdAtMs: number;
   updatedAtMs: number;

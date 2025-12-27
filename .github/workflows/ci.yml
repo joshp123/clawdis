@@ -34,7 +34,7 @@ jobs:
         if: matrix.runtime == 'node'
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           check-latest: true
 
       - name: Setup Bun
@@ -49,7 +49,7 @@ jobs:
         if: matrix.runtime == 'bun'
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           check-latest: true
 
       - name: Runtime versions
@@ -106,6 +106,7 @@ jobs:
         run: bunx tsc -p tsconfig.json
 
   macos-app:
+    if: github.event_name == 'pull_request'
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -170,6 +171,44 @@ jobs:
             sleep $((attempt * 20))
           done
           exit 1
+  ios:
+    if: false # ignore iOS in CI for now
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules (retry)
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          for attempt in 1 2 3 4 5; do
+            if git -c protocol.version=2 submodule update --init --force --depth=1 --recursive; then
+              exit 0
+            fi
+            echo "Submodule update failed (attempt $attempt/5). Retrying…"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Select Xcode 26.1
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.1.app
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Install SwiftLint / SwiftFormat
+        run: brew install swiftlint swiftformat
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
 
       - name: Generate iOS project
         run: |

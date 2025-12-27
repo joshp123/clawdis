@@ -11,7 +11,10 @@ afterEach(() => {
 describe("buildStatusMessage", () => {
   it("summarizes agent readiness and context usage", () => {
     const text = buildStatusMessage({
-      agent: { provider: "anthropic", model: "pi:opus", contextTokens: 32_000 },
+      agent: {
+        model: "anthropic/pi:opus",
+        contextTokens: 32_000,
+      },
       sessionEntry: {
         sessionId: "abc",
         updatedAt: 0,
@@ -51,6 +54,22 @@ describe("buildStatusMessage", () => {
     expect(text).toContain("Agent: embedded pi");
     expect(text).toContain("Context:");
     expect(text).toContain("Web: not linked");
+  });
+
+  it("includes group activation for group sessions", () => {
+    const text = buildStatusMessage({
+      agent: {},
+      sessionEntry: {
+        sessionId: "g1",
+        updatedAt: 0,
+        groupActivation: "always",
+      },
+      sessionKey: "group:123@g.us",
+      sessionScope: "per-sender",
+      webLinked: true,
+    });
+
+    expect(text).toContain("Group activation: always");
   });
 
   it("prefers cached prompt tokens from the session log", async () => {
@@ -96,8 +115,7 @@ describe("buildStatusMessage", () => {
 
       const text = buildStatusMessageDynamic({
         agent: {
-          provider: "anthropic",
-          model: "claude-opus-4-5",
+          model: "anthropic/claude-opus-4-5",
           contextTokens: 32_000,
         },
         sessionEntry: {

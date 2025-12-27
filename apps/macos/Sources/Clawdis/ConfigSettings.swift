@@ -3,6 +3,7 @@ import SwiftUI
 @MainActor
 struct ConfigSettings: View {
     private let isPreview = ProcessInfo.processInfo.isPreview
+    private let isNixMode = ProcessInfo.processInfo.isNixMode
     private let state = AppStateStore.shared
     private let labelColumnWidth: CGFloat = 120
     private static let browserAttachOnlyHelp =
@@ -17,6 +18,7 @@ struct ConfigSettings: View {
     @State private var models: [ModelChoice] = []
     @State private var modelsLoading = false
     @State private var modelError: String?
+    @State private var modelsSourceLabel: String?
     @AppStorage(modelCatalogPathKey) private var modelCatalogPath: String = ModelCatalogLoader.defaultPath
     @AppStorage(modelCatalogReloadKey) private var modelCatalogReloadBump: Int = 0
     @State private var allowAutosave = false
@@ -51,8 +53,11 @@ struct ConfigSettings: View {
         VStack(alignment: .leading, spacing: 14) {
             self.header
             self.agentSection
+                .disabled(self.isNixMode)
             self.heartbeatSection
+                .disabled(self.isNixMode)
             self.browserSection
+                .disabled(self.isNixMode)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -65,7 +70,9 @@ struct ConfigSettings: View {
     private var header: some View {
         Text("Clawdis CLI config")
             .font(.title3.weight(.semibold))
-        Text("Edit ~/.clawdis/clawdis.json (inbound.agent / inbound.session).")
+        Text(self.isNixMode
+            ? "This tab is read-only in Nix mode. Edit config via Nix and rebuild."
+            : "Edit ~/.clawdis/clawdis.json (agent / session / routing / messages).")
             .font(.callout)
             .foregroundStyle(.secondary)
     }
@@ -142,10 +149,16 @@ struct ConfigSettings: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+
+        if let modelsSourceLabel {
+            Text("Model catalog: \(modelsSourceLabel)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var anthropicAuthHelpText: String {
-        "Determined from Pi OAuth token file (~/.pi/agent/oauth.json) " +
+        "Determined from Clawdis OAuth token file (~/.clawdis/credentials/oauth.json) " +
             "or environment variables (ANTHROPIC_OAUTH_TOKEN / ANTHROPIC_API_KEY)."
     }
 
@@ -267,11 +280,9 @@ struct ConfigSettings: View {
 
     private func loadConfig() {
         let parsed = self.loadConfigDict()
-        let inbound = parsed["inbound"] as? [String: Any]
-        let reply = inbound?["reply"] as? [String: Any]
-        let agent = reply?["agent"] as? [String: Any]
-        let heartbeatMinutes = reply?["heartbeatMinutes"] as? Int
-        let heartbeatBody = reply?["heartbeatBody"] as? String
+        let agent = parsed["agent"] as? [String: Any]
+        let heartbeatMinutes = agent?["heartbeatMinutes"] as? Int
+        let heartbeatBody = agent?["heartbeatBody"] as? String
         let browser = parsed["browser"] as? [String: Any]
 
         let loadedModel = (agent?["model"] as? String) ?? ""
@@ -295,7 +306,7 @@ struct ConfigSettings: View {
     }
 
     private func autosaveConfig() {
-        guard self.allowAutosave else { return }
+        guard self.allowAutosave, !self.isNixMode else { return }
         Task { await self.saveConfig() }
     }
 
@@ -305,9 +316,7 @@ struct ConfigSettings: View {
         defer { self.configSaving = false }
 
         var root = self.loadConfigDict()
-        var inbound = root["inbound"] as? [String: Any] ?? [:]
-        var reply = inbound["reply"] as? [String: Any] ?? [:]
-        var agent = reply["agent"] as? [String: Any] ?? [:]
+        var agent = root["agent"] as? [String: Any] ?? [:]
         var browser = root["browser"] as? [String: Any] ?? [:]
 
         let chosenModel = (self.configModel == "__custom__" ? self.customModel : self.configModel)
@@ -315,19 +324,16 @@ struct ConfigSettings: View {
         let trimmedModel = chosenModel
         if !trimmedModel.isEmpty { agent["model"] = trimmedModel }
 
-        reply["agent"] = agent
-
         if let heartbeatMinutes {
-            reply["heartbeatMinutes"] = heartbeatMinutes
+            agent["heartbeatMinutes"] = heartbeatMinutes
         }
 
         let trimmedBody = self.heartbeatBody.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedBody.isEmpty {
-            reply["heartbeatBody"] = trimmedBody
+            agent["heartbeatBody"] = trimmedBody
         }
 
-        inbound["reply"] = reply
-        root["inbound"] = inbound
+        root["agent"] = agent
 
         browser["enabled"] = self.browserEnabled
         let trimmedUrl = self.browserControlUrl.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -410,18 +416,42 @@ struct ConfigSettings: View {
         guard !self.modelsLoading else { return }
         self.modelsLoading = true
         self.modelError = nil
+        self.modelsSourceLabel = nil
         do {
-            let loaded = try await ModelCatalogLoader.load(from: self.modelCatalogPath)
-            self.models = loaded
-            if !self.configModel.isEmpty, !loaded.contains(where: { $0.id == self.configModel }) {
+            let res: ModelsListResult =
+                try await GatewayConnection.shared
+                    .requestDecoded(
+                        method: .modelsList,
+                        timeoutMs: 15000)
+            self.models = res.models
+            self.modelsSourceLabel = "gateway"
+            if !self.configModel.isEmpty,
+               !res.models.contains(where: { $0.id == self.configModel })
+            {
                 self.customModel = self.configModel
                 self.configModel = "__custom__"
             }
         } catch {
-            self.modelError = error.localizedDescription
-            self.models = []
+            do {
+                let loaded = try await ModelCatalogLoader.load(from: self.modelCatalogPath)
+                self.models = loaded
+                self.modelsSourceLabel = "local fallback"
+                if !self.configModel.isEmpty,
+                   !loaded.contains(where: { $0.id == self.configModel })
+                {
+                    self.customModel = self.configModel
+                    self.configModel = "__custom__"
+                }
+            } catch {
+                self.modelError = error.localizedDescription
+                self.models = []
+            }
         }
         self.modelsLoading = false
+    }
+
+    private struct ModelsListResult: Decodable {
+        let models: [ModelChoice]
     }
 
     private var selectedContextLabel: String? {

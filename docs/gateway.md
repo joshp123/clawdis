@@ -19,13 +19,16 @@ pnpm clawdis gateway --port 18789
 pnpm clawdis gateway --port 18789 --verbose
 # if the port is busy, terminate listeners then start:
 pnpm clawdis gateway --force
+# dev loop (auto-reload on TS changes):
+pnpm gateway:watch
 ```
 - Binds WebSocket control plane to `127.0.0.1:<port>` (default 18789).
-- Starts a Canvas file server by default on the **same port** as the Gateway (`http://<gateway-host>:18789/__clawdis__/canvas/`, serves `~/clawd/canvas`). Disable with `canvasHost.enabled=false` or `CLAWDIS_SKIP_CANVAS_HOST=1`.
+- Starts a Canvas file server by default on `canvasHost.port` (default `18793`), serving `http://<gateway-host>:18793/__clawdis__/canvas/` from `~/clawd/canvas`. Disable with `canvasHost.enabled=false` or `CLAWDIS_SKIP_CANVAS_HOST=1`.
 - Logs to stdout; use launchd/systemd to keep it alive and rotate logs.
 - Pass `--verbose` to mirror debug logging (handshakes, req/res, events) from the log file into stdio when troubleshooting.
 - `--force` uses `lsof` to find listeners on the chosen port, sends SIGTERM, logs what it killed, then starts the gateway (fails fast if `lsof` is missing).
 - If you run under a supervisor (launchd/systemd/mac app child-process mode), a stop/restart typically sends **SIGTERM**; older builds may surface this as `pnpm` `ELIFECYCLE` exit code **143** (SIGTERM), which is a normal shutdown, not a crash.
+- **SIGUSR1** triggers an in-process restart (no external supervisor required). This is what the `clawdis_gateway` agent tool uses.
 - Optional shared secret: pass `--token <value>` or set `CLAWDIS_GATEWAY_TOKEN` to require clients to send `connect.params.auth.token`.
 
 ## Remote access

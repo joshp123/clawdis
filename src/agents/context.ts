@@ -1,24 +1,28 @@
-// Lazy-load pi-ai model metadata so we can infer context windows when the agent
-// reports a model id. pi-coding-agent depends on @mariozechner/pi-ai, so it
-// should be present whenever CLAWDIS is installed from npm.
+// Lazy-load pi-coding-agent model metadata so we can infer context windows when
+// the agent reports a model id. This includes custom models.json entries.
+
+import { loadConfig } from "../config/config.js";
+import { resolveClawdisAgentDir } from "./agent-paths.js";
+import { ensureClawdisModelsJson } from "./models-config.js";
 
 type ModelEntry = { id: string; contextWindow?: number };
 
 const MODEL_CACHE = new Map<string, number>();
 const loadPromise = (async () => {
   try {
-    const piAi = (await import("@mariozechner/pi-ai")) as {
-      getProviders: () => string[];
-      getModels: (provider: string) => ModelEntry[];
-    };
-    const providers = piAi.getProviders();
-    for (const p of providers) {
-      const models = piAi.getModels(p) as ModelEntry[];
-      for (const m of models) {
-        if (!m?.id) continue;
-        if (typeof m.contextWindow === "number" && m.contextWindow > 0) {
-          MODEL_CACHE.set(m.id, m.contextWindow);
-        }
+    const { discoverAuthStorage, discoverModels } = await import(
+      "@mariozechner/pi-coding-agent"
+    );
+    const cfg = loadConfig();
+    await ensureClawdisModelsJson(cfg);
+    const agentDir = resolveClawdisAgentDir();
+    const authStorage = discoverAuthStorage(agentDir);
+    const modelRegistry = discoverModels(authStorage, agentDir);
+    const models = modelRegistry.getAll() as ModelEntry[];
+    for (const m of models) {
+      if (!m?.id) continue;
+      if (typeof m.contextWindow === "number" && m.contextWindow > 0) {
+        MODEL_CACHE.set(m.id, m.contextWindow);
       }
     }
   } catch {

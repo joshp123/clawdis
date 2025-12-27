@@ -5,6 +5,12 @@ import {
   DEFAULT_MODEL,
   DEFAULT_PROVIDER,
 } from "../agents/defaults.js";
+import { loadModelCatalog } from "../agents/model-catalog.js";
+import {
+  buildAllowedModelSet,
+  modelKey,
+  resolveConfiguredModelRef,
+} from "../agents/model-selection.js";
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
 import {
@@ -66,7 +72,7 @@ function resolveSession(opts: {
   to?: string;
   sessionId?: string;
 }): SessionResolution {
-  const sessionCfg = opts.cfg.inbound?.session;
+  const sessionCfg = opts.cfg.session;
   const scope = sessionCfg?.scope ?? "per-sender";
   const mainKey = sessionCfg?.mainKey ?? "main";
   const idleMinutes = Math.max(
@@ -140,15 +146,15 @@ export async function agentCommand(
   }
 
   const cfg = loadConfig();
-  const agentCfg = cfg.inbound?.agent;
-  const workspaceDirRaw = cfg.inbound?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
+  const agentCfg = cfg.agent;
+  const workspaceDirRaw = cfg.agent?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
   const workspace = await ensureAgentWorkspace({
     dir: workspaceDirRaw,
     ensureBootstrapFiles: true,
   });
   const workspaceDir = workspace.dir;
 
-  const allowFrom = (cfg.inbound?.allowFrom ?? [])
+  const allowFrom = (cfg.routing?.allowFrom ?? [])
     .map((val) => normalizeE164(val))
     .filter((val) => val.length > 1);
 
@@ -245,8 +251,57 @@ export async function agentCommand(
     await saveSessionStore(storePath, sessionStore);
   }
 
-  const provider = agentCfg?.provider?.trim() || DEFAULT_PROVIDER;
-  const model = agentCfg?.model?.trim() || DEFAULT_MODEL;
+  const { provider: defaultProvider, model: defaultModel } =
+    resolveConfiguredModelRef({
+      cfg,
+      defaultProvider: DEFAULT_PROVIDER,
+      defaultModel: DEFAULT_MODEL,
+    });
+  let provider = defaultProvider;
+  let model = defaultModel;
+  const hasAllowlist = (agentCfg?.allowedModels?.length ?? 0) > 0;
+  const hasStoredOverride = Boolean(
+    sessionEntry?.modelOverride || sessionEntry?.providerOverride,
+  );
+  const needsModelCatalog = hasAllowlist || hasStoredOverride;
+  let allowedModelKeys = new Set<string>();
+
+  if (needsModelCatalog) {
+    const catalog = await loadModelCatalog({ config: cfg });
+    const allowed = buildAllowedModelSet({
+      cfg,
+      catalog,
+      defaultProvider,
+    });
+    allowedModelKeys = allowed.allowedKeys;
+  }
+
+  if (sessionEntry && sessionStore && sessionKey && hasStoredOverride) {
+    const overrideProvider =
+      sessionEntry.providerOverride?.trim() || defaultProvider;
+    const overrideModel = sessionEntry.modelOverride?.trim();
+    if (overrideModel) {
+      const key = modelKey(overrideProvider, overrideModel);
+      if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
+        delete sessionEntry.providerOverride;
+        delete sessionEntry.modelOverride;
+        sessionEntry.updatedAt = Date.now();
+        sessionStore[sessionKey] = sessionEntry;
+        await saveSessionStore(storePath, sessionStore);
+      }
+    }
+  }
+
+  const storedProviderOverride = sessionEntry?.providerOverride?.trim();
+  const storedModelOverride = sessionEntry?.modelOverride?.trim();
+  if (storedModelOverride) {
+    const candidateProvider = storedProviderOverride || defaultProvider;
+    const key = modelKey(candidateProvider, storedModelOverride);
+    if (allowedModelKeys.size === 0 || allowedModelKeys.has(key)) {
+      provider = candidateProvider;
+      model = storedModelOverride;
+    }
+  }
   const sessionFile = resolveSessionTranscriptPath(sessionId);
 
   const startedAt = Date.now();
@@ -266,6 +321,7 @@ export async function agentCommand(
   try {
     result = await runEmbeddedPiAgent({
       sessionId,
+      sessionKey,
       sessionFile,
       workspaceDir,
       config: cfg,
@@ -358,6 +414,7 @@ export async function agentCommand(
 
   const whatsappTarget = opts.to ? normalizeE164(opts.to) : allowFrom[0];
   const telegramTarget = opts.to?.trim() || undefined;
+  const discordTarget = opts.to?.trim() || undefined;
 
   const logDeliveryError = (err: unknown) => {
     const deliveryTarget =
@@ -365,7 +422,9 @@ export async function agentCommand(
         ? telegramTarget
         : deliveryProvider === "whatsapp"
           ? whatsappTarget
-          : undefined;
+          : deliveryProvider === "discord"
+            ? discordTarget
+            : undefined;
     const message = `Delivery failed (${deliveryProvider}${deliveryTarget ? ` to ${deliveryTarget}` : ""}): ${String(err)}`;
     runtime.error?.(message);
     if (!runtime.error) runtime.log(message);
@@ -374,13 +433,20 @@ export async function agentCommand(
   if (deliver) {
     if (deliveryProvider === "whatsapp" && !whatsappTarget) {
       const err = new Error(
-        "Delivering to WhatsApp requires --to <E.164> or inbound.allowFrom[0]",
+        "Delivering to WhatsApp requires --to <E.164> or routing.allowFrom[0]",
       );
       if (!bestEffortDeliver) throw err;
       logDeliveryError(err);
     }
     if (deliveryProvider === "telegram" && !telegramTarget) {
       const err = new Error("Delivering to Telegram requires --to <chatId>");
+      if (!bestEffortDeliver) throw err;
+      logDeliveryError(err);
+    }
+    if (deliveryProvider === "discord" && !discordTarget) {
+      const err = new Error(
+        "Delivering to Discord requires --to <channelId|user:ID|channel:ID>",
+      );
       if (!bestEffortDeliver) throw err;
       logDeliveryError(err);
     }
@@ -394,6 +460,7 @@ export async function agentCommand(
     if (
       deliveryProvider !== "whatsapp" &&
       deliveryProvider !== "telegram" &&
+      deliveryProvider !== "discord" &&
       deliveryProvider !== "webchat"
     ) {
       const err = new Error(`Unknown provider: ${deliveryProvider}`);
@@ -475,6 +542,29 @@ export async function agentCommand(
             first = false;
             await deps.sendMessageTelegram(telegramTarget, caption, {
               verbose: false,
+              mediaUrl: url,
+            });
+          }
+        }
+      } catch (err) {
+        if (!bestEffortDeliver) throw err;
+        logDeliveryError(err);
+      }
+    }
+
+    if (deliveryProvider === "discord" && discordTarget) {
+      try {
+        if (media.length === 0) {
+          await deps.sendMessageDiscord(discordTarget, text, {
+            token: process.env.DISCORD_BOT_TOKEN,
+          });
+        } else {
+          let first = true;
+          for (const url of media) {
+            const caption = first ? text : "";
+            first = false;
+            await deps.sendMessageDiscord(discordTarget, caption, {
+              token: process.env.DISCORD_BOT_TOKEN,
               mediaUrl: url,
             });
           }

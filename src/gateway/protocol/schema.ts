@@ -77,6 +77,7 @@ export const ConnectParamsSchema = Type.Object(
       Type.Object(
         {
           token: Type.Optional(Type.String()),
+          password: Type.Optional(Type.String()),
         },
         { additionalProperties: false },
       ),
@@ -253,6 +254,11 @@ export const NodePairVerifyParamsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const NodeRenameParamsSchema = Type.Object(
+  { nodeId: NonEmptyString, displayName: NonEmptyString },
+  { additionalProperties: false },
+);
+
 export const NodeListParamsSchema = Type.Object(
   {},
   { additionalProperties: false },
@@ -289,6 +295,34 @@ export const SessionsPatchParamsSchema = Type.Object(
     key: NonEmptyString,
     thinkingLevel: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     verboseLevel: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
+    groupActivation: Type.Optional(
+      Type.Union([
+        Type.Literal("mention"),
+        Type.Literal("always"),
+        Type.Null(),
+      ]),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+export const SessionsResetParamsSchema = Type.Object(
+  { key: NonEmptyString },
+  { additionalProperties: false },
+);
+
+export const SessionsDeleteParamsSchema = Type.Object(
+  {
+    key: NonEmptyString,
+    deleteTranscript: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const SessionsCompactParamsSchema = Type.Object(
+  {
+    key: NonEmptyString,
+    maxLines: Type.Optional(Type.Integer({ minimum: 1 })),
   },
   { additionalProperties: false },
 );
@@ -301,6 +335,52 @@ export const ConfigGetParamsSchema = Type.Object(
 export const ConfigSetParamsSchema = Type.Object(
   {
     raw: NonEmptyString,
+  },
+  { additionalProperties: false },
+);
+
+export const ProvidersStatusParamsSchema = Type.Object(
+  {
+    probe: Type.Optional(Type.Boolean()),
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 0 })),
+  },
+  { additionalProperties: false },
+);
+
+export const WebLoginStartParamsSchema = Type.Object(
+  {
+    force: Type.Optional(Type.Boolean()),
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    verbose: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+export const WebLoginWaitParamsSchema = Type.Object(
+  {
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 0 })),
+  },
+  { additionalProperties: false },
+);
+
+export const ModelChoiceSchema = Type.Object(
+  {
+    id: NonEmptyString,
+    name: NonEmptyString,
+    provider: NonEmptyString,
+    contextWindow: Type.Optional(Type.Integer({ minimum: 1 })),
+  },
+  { additionalProperties: false },
+);
+
+export const ModelsListParamsSchema = Type.Object(
+  {},
+  { additionalProperties: false },
+);
+
+export const ModelsListResultSchema = Type.Object(
+  {
+    models: Type.Array(ModelChoiceSchema),
   },
   { additionalProperties: false },
 );
@@ -375,6 +455,7 @@ export const CronPayloadSchema = Type.Union([
           Type.Literal("last"),
           Type.Literal("whatsapp"),
           Type.Literal("telegram"),
+          Type.Literal("discord"),
         ]),
       ),
       to: Type.Optional(Type.String()),
@@ -412,7 +493,8 @@ export const CronJobStateSchema = Type.Object(
 export const CronJobSchema = Type.Object(
   {
     id: NonEmptyString,
-    name: Type.Optional(Type.String()),
+    name: NonEmptyString,
+    description: Type.Optional(Type.String()),
     enabled: Type.Boolean(),
     createdAtMs: Type.Integer({ minimum: 0 }),
     updatedAtMs: Type.Integer({ minimum: 0 }),
@@ -440,7 +522,8 @@ export const CronStatusParamsSchema = Type.Object(
 
 export const CronAddParamsSchema = Type.Object(
   {
-    name: Type.Optional(Type.String()),
+    name: NonEmptyString,
+    description: Type.Optional(Type.String()),
     enabled: Type.Optional(Type.Boolean()),
     schedule: CronScheduleSchema,
     sessionTarget: Type.Union([Type.Literal("main"), Type.Literal("isolated")]),
@@ -574,13 +657,23 @@ export const ProtocolSchemas: Record<string, TSchema> = {
   NodePairApproveParams: NodePairApproveParamsSchema,
   NodePairRejectParams: NodePairRejectParamsSchema,
   NodePairVerifyParams: NodePairVerifyParamsSchema,
+  NodeRenameParams: NodeRenameParamsSchema,
   NodeListParams: NodeListParamsSchema,
   NodeDescribeParams: NodeDescribeParamsSchema,
   NodeInvokeParams: NodeInvokeParamsSchema,
   SessionsListParams: SessionsListParamsSchema,
   SessionsPatchParams: SessionsPatchParamsSchema,
+  SessionsResetParams: SessionsResetParamsSchema,
+  SessionsDeleteParams: SessionsDeleteParamsSchema,
+  SessionsCompactParams: SessionsCompactParamsSchema,
   ConfigGetParams: ConfigGetParamsSchema,
   ConfigSetParams: ConfigSetParamsSchema,
+  ProvidersStatusParams: ProvidersStatusParamsSchema,
+  WebLoginStartParams: WebLoginStartParamsSchema,
+  WebLoginWaitParams: WebLoginWaitParamsSchema,
+  ModelChoice: ModelChoiceSchema,
+  ModelsListParams: ModelsListParamsSchema,
+  ModelsListResult: ModelsListResultSchema,
   SkillsStatusParams: SkillsStatusParamsSchema,
   SkillsInstallParams: SkillsInstallParamsSchema,
   SkillsUpdateParams: SkillsUpdateParamsSchema,
@@ -620,13 +713,23 @@ export type NodePairListParams = Static<typeof NodePairListParamsSchema>;
 export type NodePairApproveParams = Static<typeof NodePairApproveParamsSchema>;
 export type NodePairRejectParams = Static<typeof NodePairRejectParamsSchema>;
 export type NodePairVerifyParams = Static<typeof NodePairVerifyParamsSchema>;
+export type NodeRenameParams = Static<typeof NodeRenameParamsSchema>;
 export type NodeListParams = Static<typeof NodeListParamsSchema>;
 export type NodeDescribeParams = Static<typeof NodeDescribeParamsSchema>;
 export type NodeInvokeParams = Static<typeof NodeInvokeParamsSchema>;
 export type SessionsListParams = Static<typeof SessionsListParamsSchema>;
 export type SessionsPatchParams = Static<typeof SessionsPatchParamsSchema>;
+export type SessionsResetParams = Static<typeof SessionsResetParamsSchema>;
+export type SessionsDeleteParams = Static<typeof SessionsDeleteParamsSchema>;
+export type SessionsCompactParams = Static<typeof SessionsCompactParamsSchema>;
 export type ConfigGetParams = Static<typeof ConfigGetParamsSchema>;
 export type ConfigSetParams = Static<typeof ConfigSetParamsSchema>;
+export type ProvidersStatusParams = Static<typeof ProvidersStatusParamsSchema>;
+export type WebLoginStartParams = Static<typeof WebLoginStartParamsSchema>;
+export type WebLoginWaitParams = Static<typeof WebLoginWaitParamsSchema>;
+export type ModelChoice = Static<typeof ModelChoiceSchema>;
+export type ModelsListParams = Static<typeof ModelsListParamsSchema>;
+export type ModelsListResult = Static<typeof ModelsListResultSchema>;
 export type SkillsStatusParams = Static<typeof SkillsStatusParamsSchema>;
 export type SkillsInstallParams = Static<typeof SkillsInstallParamsSchema>;
 export type SkillsUpdateParams = Static<typeof SkillsUpdateParamsSchema>;

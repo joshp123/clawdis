@@ -2,6 +2,7 @@ import AVFoundation
 import Foundation
 import OSLog
 import Speech
+import SwabbleKit
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -35,6 +36,7 @@ actor VoiceWakeRuntime {
     private var currentConfig: RuntimeConfig?
     private var listeningState: ListeningState = .idle
     private var overlayToken: UUID?
+    private var activeTriggerEndTime: TimeInterval?
 
     // Tunables
     // Silence threshold once we've captured user speech (post-trigger).
@@ -68,6 +70,14 @@ actor VoiceWakeRuntime {
         let localeID: String?
         let triggerChime: VoiceWakeChime
         let sendChime: VoiceWakeChime
+    }
+
+    private struct RecognitionUpdate {
+        let transcript: String?
+        let segments: [WakeWordSegment]
+        let isFinal: Bool
+        let error: Error?
+        let generation: Int
     }
 
     func refresh(state: AppState) async {
@@ -147,13 +157,18 @@ actor VoiceWakeRuntime {
             self.recognitionTask = recognizer.recognitionTask(with: request) { [weak self, generation] result, error in
                 guard let self else { return }
                 let transcript = result?.bestTranscription.formattedString
+                let segments = result.flatMap { result in
+                    transcript
+                        .map { WakeWordSpeechSegments.from(transcription: result.bestTranscription, transcript: $0) }
+                } ?? []
                 let isFinal = result?.isFinal ?? false
-                Task { await self.handleRecognition(
+                let update = RecognitionUpdate(
                     transcript: transcript,
+                    segments: segments,
                     isFinal: isFinal,
                     error: error,
-                    config: config,
-                    generation: generation) }
+                    generation: generation)
+                Task { await self.handleRecognition(update, config: config) }
             }
 
             self.logger.info("voicewake runtime started")
@@ -184,6 +199,7 @@ actor VoiceWakeRuntime {
         self.audioEngine = nil
         self.currentConfig = nil
         self.listeningState = .idle
+        self.activeTriggerEndTime = nil
         self.logger.debug("voicewake runtime stopped")
         DiagnosticsFileLog.shared.log(category: "voicewake.runtime", event: "stopped")
 
@@ -204,30 +220,28 @@ actor VoiceWakeRuntime {
         self.recognizer = SFSpeechRecognizer(locale: locale)
     }
 
-    private func handleRecognition(
-        transcript: String?,
-        isFinal: Bool,
-        error: Error?,
-        config: RuntimeConfig,
-        generation: Int) async
-    {
-        if generation != self.recognitionGeneration {
+    private func handleRecognition(_ update: RecognitionUpdate, config: RuntimeConfig) async {
+        if update.generation != self.recognitionGeneration {
             return // stale callback from a superseded recognizer session
         }
-        if let error {
+        if let error = update.error {
             self.logger.debug("voicewake recognition error: \(error.localizedDescription, privacy: .public)")
         }
 
-        guard let transcript else { return }
+        guard let transcript = update.transcript else { return }
 
         let now = Date()
         if !transcript.isEmpty {
             self.lastHeard = now
             if self.isCapturing {
-                let trimmed = Self.trimmedAfterTrigger(transcript, triggers: config.triggers)
+                let trimmed = Self.commandAfterTrigger(
+                    transcript: transcript,
+                    segments: update.segments,
+                    triggerEndTime: self.activeTriggerEndTime,
+                    triggers: config.triggers)
                 self.capturedTranscript = trimmed
                 self.updateHeardBeyondTrigger(withTrimmed: trimmed)
-                if isFinal {
+                if update.isFinal {
                     self.committedTranscript = trimmed
                     self.volatileTranscript = ""
                 } else {
@@ -237,7 +251,7 @@ actor VoiceWakeRuntime {
                 let attributed = Self.makeAttributed(
                     committed: self.committedTranscript,
                     volatile: self.volatileTranscript,
-                    isFinal: isFinal)
+                    isFinal: update.isFinal)
                 let snapshot = self.committedTranscript + self.volatileTranscript
                 if let token = self.overlayToken {
                     await MainActor.run {
@@ -252,37 +266,27 @@ actor VoiceWakeRuntime {
 
         if self.isCapturing { return }
 
-        if Self.matches(text: transcript, triggers: config.triggers) {
+        let gateConfig = WakeWordGateConfig(triggers: config.triggers)
+        if let match = WakeWordGate.match(transcript: transcript, segments: update.segments, config: gateConfig) {
             if let cooldown = cooldownUntil, now < cooldown {
                 return
             }
-            await self.beginCapture(transcript: transcript, config: config)
+            await self.beginCapture(command: match.command, triggerEndTime: match.triggerEndTime, config: config)
         }
     }
 
-    private static func matches(text: String, triggers: [String]) -> Bool {
-        guard !text.isEmpty else { return false }
-        let normalized = text.lowercased()
-        for trigger in triggers {
-            let t = trigger.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            if t.isEmpty { continue }
-            if normalized.contains(t) { return true }
-        }
-        return false
-    }
-
-    private func beginCapture(transcript: String, config: RuntimeConfig) async {
+    private func beginCapture(command: String, triggerEndTime: TimeInterval, config: RuntimeConfig) async {
         self.listeningState = .voiceWake
         self.isCapturing = true
         DiagnosticsFileLog.shared.log(category: "voicewake.runtime", event: "beginCapture")
-        let trimmed = Self.trimmedAfterTrigger(transcript, triggers: config.triggers)
-        self.capturedTranscript = trimmed
+        self.capturedTranscript = command
         self.committedTranscript = ""
-        self.volatileTranscript = trimmed
+        self.volatileTranscript = command
         self.captureStartedAt = Date()
         self.cooldownUntil = nil
-        self.heardBeyondTrigger = !trimmed.isEmpty
+        self.heardBeyondTrigger = !command.isEmpty
         self.triggerChimePlayed = false
+        self.activeTriggerEndTime = triggerEndTime
 
         if config.triggerChime != .none, !self.triggerChimePlayed {
             self.triggerChimePlayed = true
@@ -354,6 +358,7 @@ actor VoiceWakeRuntime {
         self.lastHeard = nil
         self.heardBeyondTrigger = false
         self.triggerChimePlayed = false
+        self.activeTriggerEndTime = nil
 
         await MainActor.run { AppStateStore.shared.stopVoiceEars() }
         if let token = self.overlayToken {
@@ -467,6 +472,22 @@ actor VoiceWakeRuntime {
         return text
     }
 
+    private static func commandAfterTrigger(
+        transcript: String,
+        segments: [WakeWordSegment],
+        triggerEndTime: TimeInterval?,
+        triggers: [String]) -> String
+    {
+        guard let triggerEndTime else {
+            return self.trimmedAfterTrigger(transcript, triggers: triggers)
+        }
+        let trimmed = WakeWordGate.commandText(
+            transcript: transcript,
+            segments: segments,
+            triggerEndTime: triggerEndTime)
+        return trimmed.isEmpty ? self.trimmedAfterTrigger(transcript, triggers: triggers) : trimmed
+    }
+
     #if DEBUG
     static func _testTrimmedAfterTrigger(_ text: String, triggers: [String]) -> String {
         self.trimmedAfterTrigger(text, triggers: triggers)
@@ -481,9 +502,6 @@ actor VoiceWakeRuntime {
             .attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor ?? .clear
     }
 
-    static func _testMatches(text: String, triggers: [String]) -> Bool {
-        self.matches(text: text, triggers: triggers)
-    }
     #endif
 
     private static func delta(after committed: String, current: String) -> String {

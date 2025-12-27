@@ -10,10 +10,21 @@ import path from "node:path";
 import chalk from "chalk";
 import { type WebSocket, WebSocketServer } from "ws";
 import { lookupContextTokens } from "../agents/context.js";
-import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL } from "../agents/defaults.js";
+import {
+  DEFAULT_CONTEXT_TOKENS,
+  DEFAULT_MODEL,
+  DEFAULT_PROVIDER,
+} from "../agents/defaults.js";
+import {
+  loadModelCatalog,
+  type ModelCatalogEntry,
+  resetModelCatalogCacheForTest,
+} from "../agents/model-catalog.js";
+import { resolveConfiguredModelRef } from "../agents/model-selection.js";
 import { installSkill } from "../agents/skills-install.js";
 import { buildWorkspaceSkillStatus } from "../agents/skills-status.js";
 import { DEFAULT_AGENT_WORKSPACE_DIR } from "../agents/workspace.js";
+import { normalizeGroupActivation } from "../auto-reply/group-activation.js";
 import {
   normalizeThinkLevel,
   normalizeVerboseLevel,
@@ -24,7 +35,9 @@ import {
 } from "../canvas-host/a2ui.js";
 import {
   type CanvasHostHandler,
+  type CanvasHostServer,
   createCanvasHostHandler,
+  startCanvasHost,
 } from "../canvas-host/server.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommand } from "../commands/agent.js";
@@ -33,6 +46,7 @@ import { getStatusSummary } from "../commands/status.js";
 import {
   type ClawdisConfig,
   CONFIG_PATH_CLAWDIS,
+  isNixMode,
   loadConfig,
   parseConfigJson5,
   readConfigFileSnapshot,
@@ -53,26 +67,41 @@ import {
 } from "../cron/run-log.js";
 import { CronService } from "../cron/service.js";
 import { resolveCronStorePath } from "../cron/store.js";
-import type { CronJobCreate, CronJobPatch } from "../cron/types.js";
+import type { CronJob, CronJobCreate, CronJobPatch } from "../cron/types.js";
+import {
+  monitorDiscordProvider,
+  sendMessageDiscord,
+} from "../discord/index.js";
+import { type DiscordProbe, probeDiscord } from "../discord/probe.js";
 import { isVerbose } from "../globals.js";
 import { onAgentEvent } from "../infra/agent-events.js";
 import { startGatewayBonjourAdvertiser } from "../infra/bonjour.js";
 import { startNodeBridgeServer } from "../infra/bridge/server.js";
+import { resolveCanvasHostUrl } from "../infra/canvas-host-url.js";
 import { GatewayLockError } from "../infra/gateway-lock.js";
 import {
   getLastHeartbeatEvent,
   onHeartbeatEvent,
 } from "../infra/heartbeat-events.js";
+import {
+  setHeartbeatsEnabled,
+  startHeartbeatRunner,
+} from "../infra/heartbeat-runner.js";
+import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
 import {
   approveNodePairing,
   listNodePairing,
   rejectNodePairing,
+  renamePairedNode,
   requestNodePairing,
   verifyNodeToken,
 } from "../infra/node-pairing.js";
 import { ensureClawdisCliOnPath } from "../infra/path-env.js";
-import { enqueueSystemEvent } from "../infra/system-events.js";
+import {
+  enqueueSystemEvent,
+  isSystemEventContextChanged,
+} from "../infra/system-events.js";
 import {
   listSystemPresence,
   updateSystemPresence,
@@ -82,7 +111,13 @@ import {
   pickPrimaryTailnetIPv4,
   pickPrimaryTailnetIPv6,
 } from "../infra/tailnet.js";
-import { getTailnetHostname } from "../infra/tailscale.js";
+import {
+  disableTailscaleFunnel,
+  disableTailscaleServe,
+  enableTailscaleFunnel,
+  enableTailscaleServe,
+  getTailnetHostname,
+} from "../infra/tailscale.js";
 import {
   defaultVoiceWakeTriggers,
   loadVoiceWakeConfig,
@@ -92,22 +127,165 @@ import {
   WIDE_AREA_DISCOVERY_DOMAIN,
   writeWideAreaBridgeZone,
 } from "../infra/widearea-dns.js";
-import { logError, logInfo, logWarn } from "../logger.js";
-import { getChildLogger, getResolvedLoggerSettings } from "../logging.js";
+import { rawDataToString } from "../infra/ws.js";
+import {
+  createSubsystemLogger,
+  getChildLogger,
+  getResolvedLoggerSettings,
+  runtimeForLogger,
+} from "../logging.js";
 import { setCommandLaneConcurrency } from "../process/command-queue.js";
 import { runExec } from "../process/exec.js";
 import { monitorWebProvider, webAuthExists } from "../providers/web/index.js";
 import { defaultRuntime } from "../runtime.js";
 import { monitorTelegramProvider } from "../telegram/monitor.js";
+import { probeTelegram, type TelegramProbe } from "../telegram/probe.js";
 import { sendMessageTelegram } from "../telegram/send.js";
 import { normalizeE164, resolveUserPath } from "../utils.js";
-import { setHeartbeatsEnabled } from "../web/auto-reply.js";
+import type { WebProviderStatus } from "../web/auto-reply.js";
+import { startWebLoginWithQr, waitForWebLogin } from "../web/login-qr.js";
 import { sendMessageWhatsApp } from "../web/outbound.js";
-import { requestReplyHeartbeatNow } from "../web/reply-heartbeat-wake.js";
+import { getWebAuthAgeMs, logoutWeb, readWebSelfId } from "../web/session.js";
+import {
+  assertGatewayAuthConfigured,
+  authorizeGatewayConnect,
+  type ResolvedGatewayAuth,
+} from "./auth.js";
 import { buildMessageWithAttachments } from "./chat-attachments.js";
 import { handleControlUiHttpRequest } from "./control-ui.js";
+import {
+  applyHookMappings,
+  type HookMappingResolved,
+  resolveHookMappings,
+} from "./hooks-mapping.js";
 
 ensureClawdisCliOnPath();
+
+const DEFAULT_HOOKS_PATH = "/hooks";
+const DEFAULT_HOOKS_MAX_BODY_BYTES = 256 * 1024;
+
+type HooksConfigResolved = {
+  basePath: string;
+  token: string;
+  maxBodyBytes: number;
+  mappings: HookMappingResolved[];
+};
+
+function resolveHooksConfig(cfg: ClawdisConfig): HooksConfigResolved | null {
+  if (cfg.hooks?.enabled !== true) return null;
+  const token = cfg.hooks?.token?.trim();
+  if (!token) {
+    throw new Error("hooks.enabled requires hooks.token");
+  }
+  const rawPath = cfg.hooks?.path?.trim() || DEFAULT_HOOKS_PATH;
+  const withSlash = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const trimmed =
+    withSlash.length > 1 ? withSlash.replace(/\/+$/, "") : withSlash;
+  if (trimmed === "/") {
+    throw new Error("hooks.path may not be '/'");
+  }
+  const maxBodyBytes =
+    cfg.hooks?.maxBodyBytes && cfg.hooks.maxBodyBytes > 0
+      ? cfg.hooks.maxBodyBytes
+      : DEFAULT_HOOKS_MAX_BODY_BYTES;
+  const mappings = resolveHookMappings(cfg.hooks);
+  return {
+    basePath: trimmed,
+    token,
+    maxBodyBytes,
+    mappings,
+  };
+}
+
+function extractHookToken(req: IncomingMessage, url: URL): string | undefined {
+  const auth =
+    typeof req.headers.authorization === "string"
+      ? req.headers.authorization.trim()
+      : "";
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    const token = auth.slice(7).trim();
+    if (token) return token;
+  }
+  const headerToken =
+    typeof req.headers["x-clawdis-token"] === "string"
+      ? req.headers["x-clawdis-token"].trim()
+      : "";
+  if (headerToken) return headerToken;
+  const queryToken = url.searchParams.get("token");
+  if (queryToken) return queryToken.trim();
+  return undefined;
+}
+
+async function readJsonBody(
+  req: IncomingMessage,
+  maxBytes: number,
+): Promise<{ ok: true; value: unknown } | { ok: false; error: string }> {
+  return await new Promise((resolve) => {
+    let done = false;
+    let total = 0;
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => {
+      if (done) return;
+      total += chunk.length;
+      if (total > maxBytes) {
+        done = true;
+        resolve({ ok: false, error: "payload too large" });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (done) return;
+      done = true;
+      const raw = Buffer.concat(chunks).toString("utf-8").trim();
+      if (!raw) {
+        resolve({ ok: true, value: {} });
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        resolve({ ok: true, value: parsed });
+      } catch (err) {
+        resolve({ ok: false, error: String(err) });
+      }
+    });
+    req.on("error", (err) => {
+      if (done) return;
+      done = true;
+      resolve({ ok: false, error: String(err) });
+    });
+  });
+}
+
+function sendJson(
+  res: import("node:http").ServerResponse,
+  status: number,
+  body: unknown,
+) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body));
+}
+
+const log = createSubsystemLogger("gateway");
+const logCanvas = log.child("canvas");
+const logBridge = log.child("bridge");
+const logDiscovery = log.child("discovery");
+const logTailscale = log.child("tailscale");
+const logProviders = log.child("providers");
+const logBrowser = log.child("browser");
+const logHealth = log.child("health");
+const logCron = log.child("cron");
+const logHooks = log.child("hooks");
+const logWsControl = log.child("ws");
+const logWhatsApp = logProviders.child("whatsapp");
+const logTelegram = logProviders.child("telegram");
+const logDiscord = logProviders.child("discord");
+const canvasRuntime = runtimeForLogger(logCanvas);
+const whatsappRuntimeEnv = runtimeForLogger(logWhatsApp);
+const telegramRuntimeEnv = runtimeForLogger(logTelegram);
+const discordRuntimeEnv = runtimeForLogger(logDiscord);
 
 function resolveBonjourCliPath(): string | undefined {
   const envPath = process.env.CLAWDIS_CLI_PATH?.trim();
@@ -144,16 +322,27 @@ let stopBrowserControlServerIfStarted: (() => Promise<void>) | null = null;
 
 async function startBrowserControlServerIfEnabled(): Promise<void> {
   if (process.env.CLAWDIS_SKIP_BROWSER_CONTROL_SERVER === "1") return;
-  // Lazy import to keep optional heavyweight deps (playwright/electron) out of
-  // embedded/daemon builds.
-  const spec =
-    process.env.CLAWDIS_BROWSER_CONTROL_MODULE ??
-    // Intentionally not a static string literal so bun bundling can omit it.
-    // (The embedded gateway sets CLAWDIS_SKIP_BROWSER_CONTROL_SERVER=1.)
-    ["..", "browser", "server.js"].join("/");
-  const mod = await import(spec);
+  // Lazy import: keeps startup fast, but still bundles for the embedded
+  // gateway (bun --compile) via the static specifier path.
+  const override = process.env.CLAWDIS_BROWSER_CONTROL_MODULE?.trim();
+  const mod = override
+    ? await import(override)
+    : await import("../browser/server.js");
   stopBrowserControlServerIfStarted = mod.stopBrowserControlServer;
-  await mod.startBrowserControlServerFromConfig(defaultRuntime);
+  await mod.startBrowserControlServerFromConfig();
+}
+
+type GatewayModelChoice = ModelCatalogEntry;
+
+// Test-only escape hatch: model catalog is cached at module scope for the
+// process lifetime, which is fine for the real gateway daemon, but makes
+// isolated unit tests harder. Keep this intentionally obscure.
+export function __resetModelCatalogCacheForTest() {
+  resetModelCatalogCacheForTest();
+}
+
+async function loadGatewayModelCatalog(): Promise<GatewayModelChoice[]> {
+  return await loadModelCatalog({ config: loadConfig() });
 }
 
 import {
@@ -164,8 +353,11 @@ import {
   formatValidationErrors,
   PROTOCOL_VERSION,
   type RequestFrame,
+  type SessionsCompactParams,
+  type SessionsDeleteParams,
   type SessionsListParams,
   type SessionsPatchParams,
+  type SessionsResetParams,
   type Snapshot,
   validateAgentParams,
   validateChatAbortParams,
@@ -181,6 +373,7 @@ import {
   validateCronRunsParams,
   validateCronStatusParams,
   validateCronUpdateParams,
+  validateModelsListParams,
   validateNodeDescribeParams,
   validateNodeInvokeParams,
   validateNodeListParams,
@@ -189,14 +382,21 @@ import {
   validateNodePairRejectParams,
   validateNodePairRequestParams,
   validateNodePairVerifyParams,
+  validateNodeRenameParams,
+  validateProvidersStatusParams,
   validateRequestFrame,
   validateSendParams,
+  validateSessionsCompactParams,
+  validateSessionsDeleteParams,
   validateSessionsListParams,
   validateSessionsPatchParams,
+  validateSessionsResetParams,
   validateSkillsInstallParams,
   validateSkillsStatusParams,
   validateSkillsUpdateParams,
   validateWakeParams,
+  validateWebLoginStartParams,
+  validateWebLoginWaitParams,
 } from "./protocol/index.js";
 import { DEFAULT_WS_SLOW_MS, getGatewayWsLogStyle } from "./ws-logging.js";
 
@@ -247,7 +447,6 @@ type GatewaySessionRow = {
   totalTokens?: number;
   model?: string;
   contextTokens?: number;
-  syncing?: boolean | string;
 };
 
 type SessionsListResult = {
@@ -267,9 +466,11 @@ type SessionsPatchResult = {
 
 const METHODS = [
   "health",
+  "providers.status",
   "status",
   "config.get",
   "config.set",
+  "models.list",
   "skills.status",
   "skills.install",
   "skills.update",
@@ -277,6 +478,9 @@ const METHODS = [
   "voicewake.set",
   "sessions.list",
   "sessions.patch",
+  "sessions.reset",
+  "sessions.delete",
+  "sessions.compact",
   "last-heartbeat",
   "set-heartbeats",
   "wake",
@@ -285,6 +489,7 @@ const METHODS = [
   "node.pair.approve",
   "node.pair.reject",
   "node.pair.verify",
+  "node.rename",
   "node.list",
   "node.describe",
   "node.invoke",
@@ -299,6 +504,10 @@ const METHODS = [
   "system-event",
   "send",
   "agent",
+  "web.login.start",
+  "web.login.wait",
+  "web.logout",
+  "telegram.logout",
   // WebChat WebSocket-native chat methods
   "chat.history",
   "chat.abort",
@@ -320,7 +529,10 @@ const EVENTS = [
 ];
 
 export type GatewayServer = {
-  close: () => Promise<void>;
+  close: (opts?: {
+    reason?: string;
+    restartExpectedMs?: number | null;
+  }) => Promise<void>;
 };
 
 export type GatewayServerOptions = {
@@ -342,6 +554,14 @@ export type GatewayServerOptions = {
    * Default: config `gateway.controlUi.enabled` (or true when absent).
    */
   controlUiEnabled?: boolean;
+  /**
+   * Override gateway auth configuration (merges with config).
+   */
+  auth?: import("../config/config.js").GatewayAuthConfig;
+  /**
+   * Override gateway Tailscale exposure configuration (merges with config).
+   */
+  tailscale?: import("../config/config.js").GatewayTailscaleConfig;
   /**
    * Test-only: allow canvas host startup even when NODE_ENV/VITEST would disable it.
    */
@@ -394,37 +614,6 @@ function buildSnapshot(): Snapshot {
 const MAX_PAYLOAD_BYTES = 512 * 1024; // cap incoming frame size
 const MAX_BUFFERED_BYTES = 1.5 * 1024 * 1024; // per-connection send buffer limit
 
-function deriveCanvasHostUrl(
-  req: IncomingMessage | undefined,
-  canvasPort: number | undefined,
-) {
-  if (!req || !canvasPort) return undefined;
-  const hostHeader = req.headers.host?.trim();
-  const forwardedProto =
-    typeof req.headers["x-forwarded-proto"] === "string"
-      ? req.headers["x-forwarded-proto"]
-      : Array.isArray(req.headers["x-forwarded-proto"])
-        ? req.headers["x-forwarded-proto"][0]
-        : undefined;
-  const scheme = forwardedProto === "https" ? "https" : "http";
-
-  let host = "";
-  if (hostHeader) {
-    try {
-      const parsed = new URL(`http://${hostHeader}`);
-      host = parsed.hostname;
-    } catch {
-      host = "";
-    }
-  }
-  if (!host) {
-    host = req.socket?.localAddress?.trim() ?? "";
-  }
-  if (!host) return undefined;
-
-  const formattedHost = host.includes(":") ? `[${host}]` : host;
-  return `${scheme}://${formattedHost}:${canvasPort}`;
-}
 const MAX_CHAT_HISTORY_MESSAGES_BYTES = 6 * 1024 * 1024; // keep history responses comfortably under client WS limits
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const TICK_INTERVAL_MS = 30_000;
@@ -444,6 +633,39 @@ const getGatewayToken = () => process.env.CLAWDIS_GATEWAY_TOKEN;
 
 function formatForLog(value: unknown): string {
   try {
+    if (value instanceof Error) {
+      const parts: string[] = [];
+      if (value.name) parts.push(value.name);
+      if (value.message) parts.push(value.message);
+      const code =
+        "code" in value &&
+        (typeof value.code === "string" || typeof value.code === "number")
+          ? String(value.code)
+          : "";
+      if (code) parts.push(`code=${code}`);
+      const combined = parts.filter(Boolean).join(": ").trim();
+      if (combined) {
+        return combined.length > LOG_VALUE_LIMIT
+          ? `${combined.slice(0, LOG_VALUE_LIMIT)}...`
+          : combined;
+      }
+    }
+    if (value && typeof value === "object") {
+      const rec = value as Record<string, unknown>;
+      if (typeof rec.message === "string" && rec.message.trim()) {
+        const name = typeof rec.name === "string" ? rec.name.trim() : "";
+        const code =
+          typeof rec.code === "string" || typeof rec.code === "number"
+            ? String(rec.code)
+            : "";
+        const parts = [name, rec.message.trim()].filter(Boolean);
+        if (code) parts.push(`code=${code}`);
+        const combined = parts.join(": ").trim();
+        return combined.length > LOG_VALUE_LIMIT
+          ? `${combined.slice(0, LOG_VALUE_LIMIT)}...`
+          : combined;
+      }
+    }
     const str =
       typeof value === "string" || typeof value === "number"
         ? String(value)
@@ -538,27 +760,7 @@ function readSessionMessages(
   sessionId: string,
   storePath: string | undefined,
 ): unknown[] {
-  const candidates: string[] = [];
-  if (storePath) {
-    const dir = path.dirname(storePath);
-    candidates.push(path.join(dir, `${sessionId}.jsonl`));
-  }
-  candidates.push(
-    path.join(os.homedir(), ".clawdis", "sessions", `${sessionId}.jsonl`),
-  );
-  candidates.push(
-    path.join(os.homedir(), ".pi", "agent", "sessions", `${sessionId}.jsonl`),
-  );
-  candidates.push(
-    path.join(
-      os.homedir(),
-      ".tau",
-      "agent",
-      "sessions",
-      "clawdis",
-      `${sessionId}.jsonl`,
-    ),
-  );
+  const candidates = resolveSessionTranscriptCandidates(sessionId, storePath);
 
   const filePath = candidates.find((p) => fs.existsSync(p));
   if (!filePath) return [];
@@ -569,17 +771,36 @@ function readSessionMessages(
     if (!line.trim()) continue;
     try {
       const parsed = JSON.parse(line);
-      // pi/tau logs either raw message or wrapper { message }
       if (parsed?.message) {
         messages.push(parsed.message);
-      } else if (parsed?.role && parsed?.content) {
-        messages.push(parsed);
       }
     } catch {
       // ignore bad lines
     }
   }
   return messages;
+}
+
+function resolveSessionTranscriptCandidates(
+  sessionId: string,
+  storePath: string | undefined,
+): string[] {
+  const candidates: string[] = [];
+  if (storePath) {
+    const dir = path.dirname(storePath);
+    candidates.push(path.join(dir, `${sessionId}.jsonl`));
+  }
+  candidates.push(
+    path.join(os.homedir(), ".clawdis", "sessions", `${sessionId}.jsonl`),
+  );
+  return candidates;
+}
+
+function archiveFileOnDisk(filePath: string, reason: string): string {
+  const ts = new Date().toISOString().replaceAll(":", "-");
+  const archived = `${filePath}.${reason}.${ts}`;
+  fs.renameSync(filePath, archived);
+  return archived;
 }
 
 function jsonUtf8Bytes(value: unknown): number {
@@ -608,7 +829,7 @@ function capArrayByJsonBytes<T>(
 
 function loadSessionEntry(sessionKey: string) {
   const cfg = loadConfig();
-  const sessionCfg = cfg.inbound?.session;
+  const sessionCfg = cfg.session;
   const storePath = sessionCfg?.store
     ? resolveStorePath(sessionCfg.store)
     : resolveStorePath(undefined);
@@ -625,12 +846,19 @@ function classifySessionKey(key: string): GatewaySessionRow["kind"] {
 }
 
 function getSessionDefaults(cfg: ClawdisConfig): GatewaySessionsDefaults {
-  const model = cfg.inbound?.agent?.model ?? DEFAULT_MODEL;
+  const resolved = resolveConfiguredModelRef({
+    cfg,
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
   const contextTokens =
-    cfg.inbound?.agent?.contextTokens ??
-    lookupContextTokens(model) ??
+    cfg.agent?.contextTokens ??
+    lookupContextTokens(resolved.model) ??
     DEFAULT_CONTEXT_TOKENS;
-  return { model: model ?? null, contextTokens: contextTokens ?? null };
+  return {
+    model: resolved.model ?? null,
+    contextTokens: contextTokens ?? null,
+  };
 }
 
 function listSessionsFromStore(params: {
@@ -675,7 +903,6 @@ function listSessionsFromStore(params: {
         totalTokens: total,
         model: entry?.model,
         contextTokens: entry?.contextTokens,
-        syncing: entry?.syncing,
       } satisfies GatewaySessionRow;
     })
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
@@ -978,10 +1205,18 @@ const wsInflightSince = new Map<string, number>();
 function formatError(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === "string") return err;
-  const status = (err as { status?: unknown })?.status;
-  const code = (err as { code?: unknown })?.code;
-  if (status || code)
-    return `status=${status ?? "unknown"} code=${code ?? "unknown"}`;
+  const statusValue = (err as { status?: unknown })?.status;
+  const codeValue = (err as { code?: unknown })?.code;
+  const statusText =
+    typeof statusValue === "string" || typeof statusValue === "number"
+      ? String(statusValue)
+      : undefined;
+  const codeText =
+    typeof codeValue === "string" || typeof codeValue === "number"
+      ? String(codeValue)
+      : undefined;
+  if (statusText || codeText)
+    return `status=${statusText ?? "unknown"} code=${codeText ?? "unknown"}`;
   return JSON.stringify(err, null, 2);
 }
 
@@ -995,8 +1230,7 @@ async function refreshHealthSnapshot(_opts?: { probe?: boolean }) {
         broadcastHealthUpdate(snap);
       }
       return snap;
-    })();
-    healthRefresh.finally(() => {
+    })().finally(() => {
       healthRefresh = null;
     });
   }
@@ -1017,40 +1251,380 @@ export async function startGatewayServer(
   }
   const controlUiEnabled =
     opts.controlUiEnabled ?? cfgAtStart.gateway?.controlUi?.enabled ?? true;
+  const authBase = cfgAtStart.gateway?.auth ?? {};
+  const authOverrides = opts.auth ?? {};
+  const authConfig = {
+    ...authBase,
+    ...authOverrides,
+  };
+  const tailscaleBase = cfgAtStart.gateway?.tailscale ?? {};
+  const tailscaleOverrides = opts.tailscale ?? {};
+  const tailscaleConfig = {
+    ...tailscaleBase,
+    ...tailscaleOverrides,
+  };
+  const tailscaleMode = tailscaleConfig.mode ?? "off";
+  const token = getGatewayToken();
+  const password =
+    authConfig.password ?? process.env.CLAWDIS_GATEWAY_PASSWORD ?? undefined;
+  const authMode: ResolvedGatewayAuth["mode"] =
+    authConfig.mode ?? (password ? "password" : token ? "token" : "none");
+  const allowTailscale =
+    authConfig.allowTailscale ??
+    (tailscaleMode === "serve" && authMode !== "password");
+  const resolvedAuth: ResolvedGatewayAuth = {
+    mode: authMode,
+    token,
+    password,
+    allowTailscale,
+  };
+  const hooksConfig = resolveHooksConfig(cfgAtStart);
   const canvasHostEnabled =
     process.env.CLAWDIS_SKIP_CANVAS_HOST !== "1" &&
     cfgAtStart.canvasHost?.enabled !== false;
-  if (!isLoopbackHost(bindHost) && !getGatewayToken()) {
+  assertGatewayAuthConfigured(resolvedAuth);
+  if (tailscaleMode === "funnel" && authMode !== "password") {
     throw new Error(
-      `refusing to bind gateway to ${bindHost}:${port} without CLAWDIS_GATEWAY_TOKEN`,
+      "tailscale funnel requires gateway auth mode=password (set gateway.auth.password or CLAWDIS_GATEWAY_PASSWORD)",
+    );
+  }
+  if (tailscaleMode !== "off" && !isLoopbackHost(bindHost)) {
+    throw new Error(
+      "tailscale serve/funnel requires gateway bind=loopback (127.0.0.1)",
+    );
+  }
+  if (!isLoopbackHost(bindHost) && authMode === "none") {
+    throw new Error(
+      `refusing to bind gateway to ${bindHost}:${port} without auth (set gateway.auth or CLAWDIS_GATEWAY_TOKEN)`,
     );
   }
 
+  const normalizeHookHeaders = (req: IncomingMessage) => {
+    const headers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (typeof value === "string") {
+        headers[key.toLowerCase()] = value;
+      } else if (Array.isArray(value) && value.length > 0) {
+        headers[key.toLowerCase()] = value.join(", ");
+      }
+    }
+    return headers;
+  };
+
+  const normalizeWakePayload = (
+    payload: Record<string, unknown>,
+  ):
+    | { ok: true; value: { text: string; mode: "now" | "next-heartbeat" } }
+    | { ok: false; error: string } => {
+    const text = typeof payload.text === "string" ? payload.text.trim() : "";
+    if (!text) return { ok: false, error: "text required" };
+    const mode = payload.mode === "next-heartbeat" ? "next-heartbeat" : "now";
+    return { ok: true, value: { text, mode } };
+  };
+
+  const normalizeAgentPayload = (
+    payload: Record<string, unknown>,
+  ):
+    | {
+        ok: true;
+        value: {
+          message: string;
+          name: string;
+          wakeMode: "now" | "next-heartbeat";
+          sessionKey: string;
+          deliver: boolean;
+          channel: "last" | "whatsapp" | "telegram" | "discord";
+          to?: string;
+          thinking?: string;
+          timeoutSeconds?: number;
+        };
+      }
+    | { ok: false; error: string } => {
+    const message =
+      typeof payload.message === "string" ? payload.message.trim() : "";
+    if (!message) return { ok: false, error: "message required" };
+    const nameRaw = payload.name;
+    const name =
+      typeof nameRaw === "string" && nameRaw.trim() ? nameRaw.trim() : "Hook";
+    const wakeMode =
+      payload.wakeMode === "next-heartbeat" ? "next-heartbeat" : "now";
+    const sessionKeyRaw = payload.sessionKey;
+    const sessionKey =
+      typeof sessionKeyRaw === "string" && sessionKeyRaw.trim()
+        ? sessionKeyRaw.trim()
+        : `hook:${randomUUID()}`;
+    const channelRaw = payload.channel;
+    const channel =
+      channelRaw === "whatsapp" ||
+      channelRaw === "telegram" ||
+      channelRaw === "discord" ||
+      channelRaw === "last"
+        ? channelRaw
+        : channelRaw === undefined
+          ? "last"
+          : null;
+    if (channel === null) {
+      return {
+        ok: false,
+        error: "channel must be last|whatsapp|telegram|discord",
+      };
+    }
+    const toRaw = payload.to;
+    const to =
+      typeof toRaw === "string" && toRaw.trim() ? toRaw.trim() : undefined;
+    const deliver = payload.deliver === true;
+    const thinkingRaw = payload.thinking;
+    const thinking =
+      typeof thinkingRaw === "string" && thinkingRaw.trim()
+        ? thinkingRaw.trim()
+        : undefined;
+    const timeoutRaw = payload.timeoutSeconds;
+    const timeoutSeconds =
+      typeof timeoutRaw === "number" &&
+      Number.isFinite(timeoutRaw) &&
+      timeoutRaw > 0
+        ? Math.floor(timeoutRaw)
+        : undefined;
+    return {
+      ok: true,
+      value: {
+        message,
+        name,
+        wakeMode,
+        sessionKey,
+        deliver,
+        channel,
+        to,
+        thinking,
+        timeoutSeconds,
+      },
+    };
+  };
+
+  const dispatchWakeHook = (value: {
+    text: string;
+    mode: "now" | "next-heartbeat";
+  }) => {
+    enqueueSystemEvent(value.text);
+    if (value.mode === "now") {
+      requestHeartbeatNow({ reason: "hook:wake" });
+    }
+  };
+
+  const dispatchAgentHook = (value: {
+    message: string;
+    name: string;
+    wakeMode: "now" | "next-heartbeat";
+    sessionKey: string;
+    deliver: boolean;
+    channel: "last" | "whatsapp" | "telegram" | "discord";
+    to?: string;
+    thinking?: string;
+    timeoutSeconds?: number;
+  }) => {
+    const jobId = randomUUID();
+    const now = Date.now();
+    const job: CronJob = {
+      id: jobId,
+      name: value.name,
+      enabled: true,
+      createdAtMs: now,
+      updatedAtMs: now,
+      schedule: { kind: "at", atMs: now },
+      sessionTarget: "isolated",
+      wakeMode: value.wakeMode,
+      payload: {
+        kind: "agentTurn",
+        message: value.message,
+        thinking: value.thinking,
+        timeoutSeconds: value.timeoutSeconds,
+        deliver: value.deliver,
+        channel: value.channel,
+        to: value.to,
+      },
+      state: { nextRunAtMs: now },
+    };
+
+    const runId = randomUUID();
+    void (async () => {
+      try {
+        const cfg = loadConfig();
+        const result = await runCronIsolatedAgentTurn({
+          cfg,
+          deps,
+          job,
+          message: value.message,
+          sessionKey: value.sessionKey,
+          lane: "cron",
+        });
+        const summary =
+          result.summary?.trim() || result.error?.trim() || result.status;
+        const prefix =
+          result.status === "ok"
+            ? `Hook ${value.name}`
+            : `Hook ${value.name} (${result.status})`;
+        enqueueSystemEvent(`${prefix}: ${summary}`.trim());
+        if (value.wakeMode === "now") {
+          requestHeartbeatNow({ reason: `hook:${jobId}` });
+        }
+      } catch (err) {
+        logHooks.warn(`hook agent failed: ${String(err)}`);
+        enqueueSystemEvent(`Hook ${value.name} (error): ${String(err)}`);
+        if (value.wakeMode === "now") {
+          requestHeartbeatNow({ reason: `hook:${jobId}:error` });
+        }
+      }
+    })();
+
+    return runId;
+  };
   let canvasHost: CanvasHostHandler | null = null;
+  let canvasHostServer: CanvasHostServer | null = null;
   if (canvasHostEnabled) {
     try {
       const handler = await createCanvasHostHandler({
-        runtime: defaultRuntime,
+        runtime: canvasRuntime,
         rootDir: cfgAtStart.canvasHost?.root,
         basePath: CANVAS_HOST_PATH,
         allowInTests: opts.allowCanvasHostInTests,
       });
       if (handler.rootDir) {
         canvasHost = handler;
-        defaultRuntime.log(
+        logCanvas.info(
           `canvas host mounted at http://${bindHost}:${port}${CANVAS_HOST_PATH}/ (root ${handler.rootDir})`,
         );
       }
     } catch (err) {
-      logWarn(`gateway: canvas host failed to start: ${String(err)}`);
+      logCanvas.warn(`canvas host failed to start: ${String(err)}`);
     }
   }
+
+  const handleHooksRequest = async (
+    req: IncomingMessage,
+    res: import("node:http").ServerResponse,
+  ): Promise<boolean> => {
+    if (!hooksConfig) return false;
+    const url = new URL(req.url ?? "/", `http://${bindHost}:${port}`);
+    const basePath = hooksConfig.basePath;
+    if (url.pathname !== basePath && !url.pathname.startsWith(`${basePath}/`)) {
+      return false;
+    }
+
+    const token = extractHookToken(req, url);
+    if (!token || token !== hooksConfig.token) {
+      res.statusCode = 401;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end("Unauthorized");
+      return true;
+    }
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.setHeader("Allow", "POST");
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end("Method Not Allowed");
+      return true;
+    }
+
+    const subPath = url.pathname.slice(basePath.length).replace(/^\/+/, "");
+    if (!subPath) {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end("Not Found");
+      return true;
+    }
+
+    const body = await readJsonBody(req, hooksConfig.maxBodyBytes);
+    if (!body.ok) {
+      const status = body.error === "payload too large" ? 413 : 400;
+      sendJson(res, status, { ok: false, error: body.error });
+      return true;
+    }
+
+    const payload =
+      typeof body.value === "object" && body.value !== null ? body.value : {};
+    const headers = normalizeHookHeaders(req);
+
+    if (subPath === "wake") {
+      const normalized = normalizeWakePayload(
+        payload as Record<string, unknown>,
+      );
+      if (!normalized.ok) {
+        sendJson(res, 400, { ok: false, error: normalized.error });
+        return true;
+      }
+      dispatchWakeHook(normalized.value);
+      sendJson(res, 200, { ok: true, mode: normalized.value.mode });
+      return true;
+    }
+
+    if (subPath === "agent") {
+      const normalized = normalizeAgentPayload(
+        payload as Record<string, unknown>,
+      );
+      if (!normalized.ok) {
+        sendJson(res, 400, { ok: false, error: normalized.error });
+        return true;
+      }
+      const runId = dispatchAgentHook(normalized.value);
+      sendJson(res, 202, { ok: true, runId });
+      return true;
+    }
+
+    if (hooksConfig.mappings.length > 0) {
+      try {
+        const mapped = await applyHookMappings(hooksConfig.mappings, {
+          payload: payload as Record<string, unknown>,
+          headers,
+          url,
+          path: subPath,
+        });
+        if (mapped) {
+          if (!mapped.ok) {
+            sendJson(res, 400, { ok: false, error: mapped.error });
+            return true;
+          }
+          if (mapped.action.kind === "wake") {
+            dispatchWakeHook({
+              text: mapped.action.text,
+              mode: mapped.action.mode,
+            });
+            sendJson(res, 200, { ok: true, mode: mapped.action.mode });
+            return true;
+          }
+          const runId = dispatchAgentHook({
+            message: mapped.action.message,
+            name: mapped.action.name ?? "Hook",
+            wakeMode: mapped.action.wakeMode,
+            sessionKey: mapped.action.sessionKey ?? `hook:${randomUUID()}`,
+            deliver: mapped.action.deliver === true,
+            channel: mapped.action.channel ?? "last",
+            to: mapped.action.to,
+            thinking: mapped.action.thinking,
+            timeoutSeconds: mapped.action.timeoutSeconds,
+          });
+          sendJson(res, 202, { ok: true, runId });
+          return true;
+        }
+      } catch (err) {
+        logHooks.warn(`hook mapping failed: ${String(err)}`);
+        sendJson(res, 500, { ok: false, error: "hook mapping failed" });
+        return true;
+      }
+    }
+
+    res.statusCode = 404;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("Not Found");
+    return true;
+  };
 
   const httpServer: HttpServer = createHttpServer((req, res) => {
     // Don't interfere with WebSocket upgrades; ws handles the 'upgrade' event.
     if (String(req.headers.upgrade ?? "").toLowerCase() === "websocket") return;
 
     void (async () => {
+      if (await handleHooksRequest(req, res)) return;
       if (canvasHost) {
         if (await handleA2uiHttpRequest(req, res)) return;
         if (await canvasHost.handleHttpRequest(req, res)) return;
@@ -1110,8 +1684,46 @@ export async function startGatewayServer(
       wss.emit("connection", ws, req);
     });
   });
-  const providerAbort = new AbortController();
-  const providerTasks: Array<Promise<unknown>> = [];
+  let whatsappAbort: AbortController | null = null;
+  let telegramAbort: AbortController | null = null;
+  let discordAbort: AbortController | null = null;
+  let whatsappTask: Promise<unknown> | null = null;
+  let telegramTask: Promise<unknown> | null = null;
+  let discordTask: Promise<unknown> | null = null;
+  let whatsappRuntime: WebProviderStatus = {
+    running: false,
+    connected: false,
+    reconnectAttempts: 0,
+    lastConnectedAt: null,
+    lastDisconnect: null,
+    lastMessageAt: null,
+    lastEventAt: null,
+    lastError: null,
+  };
+  let telegramRuntime: {
+    running: boolean;
+    lastStartAt?: number | null;
+    lastStopAt?: number | null;
+    lastError?: string | null;
+    mode?: "webhook" | "polling" | null;
+  } = {
+    running: false,
+    lastStartAt: null,
+    lastStopAt: null,
+    lastError: null,
+    mode: null,
+  };
+  let discordRuntime: {
+    running: boolean;
+    lastStartAt?: number | null;
+    lastStopAt?: number | null;
+    lastError?: string | null;
+  } = {
+    running: false,
+    lastStartAt: null,
+    lastStopAt: null,
+    lastError: null,
+  };
   const clients = new Set<Client>();
   let seq = 0;
   // Track per-run sequence to detect out-of-order/lost agent events.
@@ -1129,6 +1741,7 @@ export async function startGatewayServer(
     { controller: AbortController; sessionId: string; sessionKey: string }
   >();
   setCommandLaneConcurrency("cron", cfgAtStart.cron?.maxConcurrentRuns ?? 1);
+  setCommandLaneConcurrency("main", cfgAtStart.agent?.maxConcurrent ?? 1);
 
   const cronStorePath = resolveCronStorePath(cfgAtStart.cron?.store);
   const cronLogger = getChildLogger({
@@ -1142,7 +1755,7 @@ export async function startGatewayServer(
     storePath: cronStorePath,
     cronEnabled,
     enqueueSystemEvent,
-    requestReplyHeartbeatNow,
+    requestHeartbeatNow,
     runIsolatedAgentJob: async ({ job, message }) => {
       const cfg = loadConfig();
       return await runCronIsolatedAgentTurn({
@@ -1182,49 +1795,294 @@ export async function startGatewayServer(
     },
   });
 
-  const startProviders = async () => {
+  const updateWhatsAppStatus = (next: WebProviderStatus) => {
+    whatsappRuntime = next;
+  };
+
+  const startWhatsAppProvider = async () => {
+    if (whatsappTask) return;
     const cfg = loadConfig();
-    const telegramToken =
-      process.env.TELEGRAM_BOT_TOKEN ?? cfg.telegram?.botToken ?? "";
-
-    if (await webAuthExists()) {
-      defaultRuntime.log("gateway: starting WhatsApp Web provider");
-      providerTasks.push(
-        monitorWebProvider(
-          isVerbose(),
-          undefined,
-          true,
-          undefined,
-          defaultRuntime,
-          providerAbort.signal,
-        ).catch((err) => logError(`web provider exited: ${formatError(err)}`)),
-      );
-    } else {
-      defaultRuntime.log(
-        "gateway: skipping WhatsApp Web provider (no linked session)",
-      );
+    if (cfg.web?.enabled === false) {
+      whatsappRuntime = {
+        ...whatsappRuntime,
+        running: false,
+        connected: false,
+        lastError: "disabled",
+      };
+      logWhatsApp.info("skipping provider start (web.enabled=false)");
+      return;
     }
-
-    if (telegramToken.trim().length > 0) {
-      defaultRuntime.log("gateway: starting Telegram provider");
-      providerTasks.push(
-        monitorTelegramProvider({
-          token: telegramToken.trim(),
-          runtime: defaultRuntime,
-          abortSignal: providerAbort.signal,
-          useWebhook: Boolean(cfg.telegram?.webhookUrl),
-          webhookUrl: cfg.telegram?.webhookUrl,
-          webhookSecret: cfg.telegram?.webhookSecret,
-          webhookPath: cfg.telegram?.webhookPath,
-        }).catch((err) =>
-          logError(`telegram provider exited: ${formatError(err)}`),
-        ),
-      );
-    } else {
-      defaultRuntime.log(
-        "gateway: skipping Telegram provider (no TELEGRAM_BOT_TOKEN/config)",
-      );
+    if (!(await webAuthExists())) {
+      whatsappRuntime = {
+        ...whatsappRuntime,
+        running: false,
+        connected: false,
+        lastError: "not linked",
+      };
+      logWhatsApp.info("skipping provider start (no linked session)");
+      return;
     }
+    const { e164, jid } = readWebSelfId();
+    const identity = e164 ? e164 : jid ? `jid ${jid}` : "unknown";
+    logWhatsApp.info(`starting provider (${identity})`);
+    whatsappAbort = new AbortController();
+    whatsappRuntime = {
+      ...whatsappRuntime,
+      running: true,
+      connected: false,
+      lastError: null,
+    };
+    const task = monitorWebProvider(
+      isVerbose(),
+      undefined,
+      true,
+      undefined,
+      whatsappRuntimeEnv,
+      whatsappAbort.signal,
+      { statusSink: updateWhatsAppStatus },
+    )
+      .catch((err) => {
+        whatsappRuntime = {
+          ...whatsappRuntime,
+          lastError: formatError(err),
+        };
+        logWhatsApp.error(`provider exited: ${formatError(err)}`);
+      })
+      .finally(() => {
+        whatsappAbort = null;
+        whatsappTask = null;
+        whatsappRuntime = {
+          ...whatsappRuntime,
+          running: false,
+          connected: false,
+        };
+      });
+    whatsappTask = task;
+  };
+
+  const stopWhatsAppProvider = async () => {
+    if (!whatsappAbort && !whatsappTask) return;
+    whatsappAbort?.abort();
+    try {
+      await whatsappTask;
+    } catch {
+      // ignore
+    }
+    whatsappAbort = null;
+    whatsappTask = null;
+    whatsappRuntime = {
+      ...whatsappRuntime,
+      running: false,
+      connected: false,
+    };
+  };
+
+  /**
+   * Load telegram token with priority: env var > tokenFile > botToken.
+   * tokenFile supports secret managers (e.g., agenix).
+   */
+  const loadTelegramToken = (cfg: ClawdisConfig): string => {
+    if (process.env.TELEGRAM_BOT_TOKEN) {
+      return process.env.TELEGRAM_BOT_TOKEN.trim();
+    }
+    if (cfg.telegram?.tokenFile) {
+      const filePath = cfg.telegram.tokenFile;
+      if (!fs.existsSync(filePath)) {
+        logTelegram.info(`telegram tokenFile not found: ${filePath}`);
+        return "";
+      }
+      try {
+        return fs.readFileSync(filePath, "utf-8").trim();
+      } catch (err) {
+        logTelegram.info(`failed to read telegram tokenFile: ${String(err)}`);
+        return "";
+      }
+    }
+    return cfg.telegram?.botToken?.trim() ?? "";
+  };
+
+  const startTelegramProvider = async () => {
+    if (telegramTask) return;
+    const cfg = loadConfig();
+    if (cfg.telegram?.enabled === false) {
+      telegramRuntime = {
+        ...telegramRuntime,
+        running: false,
+        lastError: "disabled",
+      };
+      logTelegram.info("skipping provider start (telegram.enabled=false)");
+      return;
+    }
+    const telegramToken = loadTelegramToken(cfg);
+    if (!telegramToken.trim()) {
+      telegramRuntime = {
+        ...telegramRuntime,
+        running: false,
+        lastError: "not configured",
+      };
+      logTelegram.info(
+        "skipping provider start (no TELEGRAM_BOT_TOKEN/config)",
+      );
+      return;
+    }
+    let telegramBotLabel = "";
+    try {
+      const probe = await probeTelegram(
+        telegramToken.trim(),
+        2500,
+        cfg.telegram?.proxy,
+      );
+      const username = probe.ok ? probe.bot?.username?.trim() : null;
+      if (username) telegramBotLabel = ` (@${username})`;
+    } catch (err) {
+      if (isVerbose()) {
+        logTelegram.debug(`bot probe failed: ${String(err)}`);
+      }
+    }
+    logTelegram.info(`starting provider${telegramBotLabel}`);
+    telegramAbort = new AbortController();
+    telegramRuntime = {
+      ...telegramRuntime,
+      running: true,
+      lastStartAt: Date.now(),
+      lastError: null,
+      mode: cfg.telegram?.webhookUrl ? "webhook" : "polling",
+    };
+    const task = monitorTelegramProvider({
+      token: telegramToken.trim(),
+      runtime: telegramRuntimeEnv,
+      abortSignal: telegramAbort.signal,
+      useWebhook: Boolean(cfg.telegram?.webhookUrl),
+      webhookUrl: cfg.telegram?.webhookUrl,
+      webhookSecret: cfg.telegram?.webhookSecret,
+      webhookPath: cfg.telegram?.webhookPath,
+    })
+      .catch((err) => {
+        telegramRuntime = {
+          ...telegramRuntime,
+          lastError: formatError(err),
+        };
+        logTelegram.error(`provider exited: ${formatError(err)}`);
+      })
+      .finally(() => {
+        telegramAbort = null;
+        telegramTask = null;
+        telegramRuntime = {
+          ...telegramRuntime,
+          running: false,
+          lastStopAt: Date.now(),
+        };
+      });
+    telegramTask = task;
+  };
+
+  const stopTelegramProvider = async () => {
+    if (!telegramAbort && !telegramTask) return;
+    telegramAbort?.abort();
+    try {
+      await telegramTask;
+    } catch {
+      // ignore
+    }
+    telegramAbort = null;
+    telegramTask = null;
+    telegramRuntime = {
+      ...telegramRuntime,
+      running: false,
+      lastStopAt: Date.now(),
+    };
+  };
+
+  const startDiscordProvider = async () => {
+    if (discordTask) return;
+    const cfg = loadConfig();
+    if (cfg.discord?.enabled === false) {
+      discordRuntime = {
+        ...discordRuntime,
+        running: false,
+        lastError: "disabled",
+      };
+      logDiscord.info("skipping provider start (discord.enabled=false)");
+      return;
+    }
+    const discordToken =
+      process.env.DISCORD_BOT_TOKEN ?? cfg.discord?.token ?? "";
+    if (!discordToken.trim()) {
+      discordRuntime = {
+        ...discordRuntime,
+        running: false,
+        lastError: "not configured",
+      };
+      logDiscord.info("skipping provider start (no DISCORD_BOT_TOKEN/config)");
+      return;
+    }
+    let discordBotLabel = "";
+    try {
+      const probe = await probeDiscord(discordToken.trim(), 2500);
+      const username = probe.ok ? probe.bot?.username?.trim() : null;
+      if (username) discordBotLabel = ` (@${username})`;
+    } catch (err) {
+      if (isVerbose()) {
+        logDiscord.debug(`bot probe failed: ${String(err)}`);
+      }
+    }
+    logDiscord.info(`starting provider${discordBotLabel}`);
+    discordAbort = new AbortController();
+    discordRuntime = {
+      ...discordRuntime,
+      running: true,
+      lastStartAt: Date.now(),
+      lastError: null,
+    };
+    const task = monitorDiscordProvider({
+      token: discordToken.trim(),
+      runtime: discordRuntimeEnv,
+      abortSignal: discordAbort.signal,
+      allowFrom: cfg.discord?.allowFrom,
+      guildAllowFrom: cfg.discord?.guildAllowFrom,
+      requireMention: cfg.discord?.requireMention,
+      mediaMaxMb: cfg.discord?.mediaMaxMb,
+    })
+      .catch((err) => {
+        discordRuntime = {
+          ...discordRuntime,
+          lastError: formatError(err),
+        };
+        logDiscord.error(`provider exited: ${formatError(err)}`);
+      })
+      .finally(() => {
+        discordAbort = null;
+        discordTask = null;
+        discordRuntime = {
+          ...discordRuntime,
+          running: false,
+          lastStopAt: Date.now(),
+        };
+      });
+    discordTask = task;
+  };
+
+  const stopDiscordProvider = async () => {
+    if (!discordAbort && !discordTask) return;
+    discordAbort?.abort();
+    try {
+      await discordTask;
+    } catch {
+      // ignore
+    }
+    discordAbort = null;
+    discordTask = null;
+    discordRuntime = {
+      ...discordRuntime,
+      running: false,
+      lastStopAt: Date.now(),
+    };
+  };
+
+  const startProviders = async () => {
+    await startWhatsAppProvider();
+    await startDiscordProvider();
+    await startTelegramProvider();
   };
 
   const broadcast = (
@@ -1319,6 +2177,31 @@ export async function startGatewayServer(
     }
     return "0.0.0.0";
   })();
+
+  const canvasHostPort = (() => {
+    const configured = cfgAtStart.canvasHost?.port;
+    if (typeof configured === "number" && configured > 0) return configured;
+    return 18793;
+  })();
+
+  if (canvasHostEnabled && bridgeEnabled && bridgeHost) {
+    try {
+      const started = await startCanvasHost({
+        runtime: canvasRuntime,
+        rootDir: cfgAtStart.canvasHost?.root,
+        port: canvasHostPort,
+        listenHost: bridgeHost,
+        allowInTests: opts.allowCanvasHostInTests,
+      });
+      if (started.port > 0) {
+        canvasHostServer = started;
+      }
+    } catch (err) {
+      logCanvas.warn(
+        `failed to start on ${bridgeHost}:${canvasHostPort}: ${String(err)}`,
+      );
+    }
+  }
 
   const bridgeSubscribe = (nodeId: string, sessionKey: string) => {
     const normalizedNodeId = nodeId.trim();
@@ -1479,8 +2362,17 @@ export async function startGatewayServer(
               },
             };
           }
-          const raw = String((params as { raw?: unknown }).raw ?? "");
-          const parsedRes = parseConfigJson5(raw);
+          const rawValue = (params as { raw?: unknown }).raw;
+          if (typeof rawValue !== "string") {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: "invalid config.set params: raw (string) required",
+              },
+            };
+          }
+          const parsedRes = parseConfigJson5(rawValue);
           if (!parsedRes.ok) {
             return {
               ok: false,
@@ -1511,6 +2403,20 @@ export async function startGatewayServer(
             }),
           };
         }
+        case "models.list": {
+          const params = parseParams();
+          if (!validateModelsListParams(params)) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: `invalid models.list params: ${formatValidationErrors(validateModelsListParams.errors)}`,
+              },
+            };
+          }
+          const models = await loadGatewayModelCatalog();
+          return { ok: true, payloadJSON: JSON.stringify({ models }) };
+        }
         case "sessions.list": {
           const params = parseParams();
           if (!validateSessionsListParams(params)) {
@@ -1524,7 +2430,7 @@ export async function startGatewayServer(
           }
           const p = params as SessionsListParams;
           const cfg = loadConfig();
-          const storePath = resolveStorePath(cfg.inbound?.session?.store);
+          const storePath = resolveStorePath(cfg.session?.store);
           const store = loadSessionStore(storePath);
           const result = listSessionsFromStore({
             cfg,
@@ -1559,7 +2465,7 @@ export async function startGatewayServer(
           }
 
           const cfg = loadConfig();
-          const storePath = resolveStorePath(cfg.inbound?.session?.store);
+          const storePath = resolveStorePath(cfg.session?.store);
           const store = loadSessionStore(storePath);
           const now = Date.now();
 
@@ -1609,12 +2515,22 @@ export async function startGatewayServer(
             }
           }
 
-          if ("syncing" in p) {
-            const raw = p.syncing;
+          if ("groupActivation" in p) {
+            const raw = p.groupActivation;
             if (raw === null) {
-              delete next.syncing;
+              delete next.groupActivation;
             } else if (raw !== undefined) {
-              next.syncing = raw as boolean | string;
+              const normalized = normalizeGroupActivation(String(raw));
+              if (!normalized) {
+                return {
+                  ok: false,
+                  error: {
+                    code: ErrorCodes.INVALID_REQUEST,
+                    message: `invalid groupActivation: ${String(raw)}`,
+                  },
+                };
+              }
+              next.groupActivation = normalized;
             }
           }
 
@@ -1627,6 +2543,207 @@ export async function startGatewayServer(
             entry: next,
           };
           return { ok: true, payloadJSON: JSON.stringify(payload) };
+        }
+        case "sessions.reset": {
+          const params = parseParams();
+          if (!validateSessionsResetParams(params)) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: `invalid sessions.reset params: ${formatValidationErrors(validateSessionsResetParams.errors)}`,
+              },
+            };
+          }
+
+          const p = params as SessionsResetParams;
+          const key = String(p.key ?? "").trim();
+          if (!key) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: "key required",
+              },
+            };
+          }
+
+          const { storePath, store, entry } = loadSessionEntry(key);
+          const now = Date.now();
+          const next: SessionEntry = {
+            sessionId: randomUUID(),
+            updatedAt: now,
+            systemSent: false,
+            abortedLastRun: false,
+            thinkingLevel: entry?.thinkingLevel,
+            verboseLevel: entry?.verboseLevel,
+            model: entry?.model,
+            contextTokens: entry?.contextTokens,
+            lastChannel: entry?.lastChannel,
+            lastTo: entry?.lastTo,
+            skillsSnapshot: entry?.skillsSnapshot,
+          };
+          store[key] = next;
+          await saveSessionStore(storePath, store);
+          return {
+            ok: true,
+            payloadJSON: JSON.stringify({ ok: true, key, entry: next }),
+          };
+        }
+        case "sessions.delete": {
+          const params = parseParams();
+          if (!validateSessionsDeleteParams(params)) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: `invalid sessions.delete params: ${formatValidationErrors(validateSessionsDeleteParams.errors)}`,
+              },
+            };
+          }
+
+          const p = params as SessionsDeleteParams;
+          const key = String(p.key ?? "").trim();
+          if (!key) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: "key required",
+              },
+            };
+          }
+
+          const deleteTranscript =
+            typeof p.deleteTranscript === "boolean" ? p.deleteTranscript : true;
+
+          const { storePath, store, entry } = loadSessionEntry(key);
+          const sessionId = entry?.sessionId;
+          const existed = Boolean(store[key]);
+          if (existed) delete store[key];
+          await saveSessionStore(storePath, store);
+
+          const archived: string[] = [];
+          if (deleteTranscript && sessionId) {
+            for (const candidate of resolveSessionTranscriptCandidates(
+              sessionId,
+              storePath,
+            )) {
+              if (!fs.existsSync(candidate)) continue;
+              try {
+                archived.push(archiveFileOnDisk(candidate, "deleted"));
+              } catch {
+                // Best-effort; deleting the store entry is the main operation.
+              }
+            }
+          }
+
+          return {
+            ok: true,
+            payloadJSON: JSON.stringify({
+              ok: true,
+              key,
+              deleted: existed,
+              archived,
+            }),
+          };
+        }
+        case "sessions.compact": {
+          const params = parseParams();
+          if (!validateSessionsCompactParams(params)) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: `invalid sessions.compact params: ${formatValidationErrors(validateSessionsCompactParams.errors)}`,
+              },
+            };
+          }
+
+          const p = params as SessionsCompactParams;
+          const key = String(p.key ?? "").trim();
+          if (!key) {
+            return {
+              ok: false,
+              error: {
+                code: ErrorCodes.INVALID_REQUEST,
+                message: "key required",
+              },
+            };
+          }
+
+          const maxLines =
+            typeof p.maxLines === "number" && Number.isFinite(p.maxLines)
+              ? Math.max(1, Math.floor(p.maxLines))
+              : 400;
+
+          const { storePath, store, entry } = loadSessionEntry(key);
+          const sessionId = entry?.sessionId;
+          if (!sessionId) {
+            return {
+              ok: true,
+              payloadJSON: JSON.stringify({
+                ok: true,
+                key,
+                compacted: false,
+                reason: "no sessionId",
+              }),
+            };
+          }
+
+          const filePath = resolveSessionTranscriptCandidates(
+            sessionId,
+            storePath,
+          ).find((candidate) => fs.existsSync(candidate));
+          if (!filePath) {
+            return {
+              ok: true,
+              payloadJSON: JSON.stringify({
+                ok: true,
+                key,
+                compacted: false,
+                reason: "no transcript",
+              }),
+            };
+          }
+
+          const raw = fs.readFileSync(filePath, "utf-8");
+          const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
+          if (lines.length <= maxLines) {
+            return {
+              ok: true,
+              payloadJSON: JSON.stringify({
+                ok: true,
+                key,
+                compacted: false,
+                kept: lines.length,
+              }),
+            };
+          }
+
+          const archived = archiveFileOnDisk(filePath, "bak");
+          const keptLines = lines.slice(-maxLines);
+          fs.writeFileSync(filePath, `${keptLines.join("\n")}\n`, "utf-8");
+
+          // Token counts no longer match; clear so status + UI reflect reality after the next turn.
+          if (store[key]) {
+            delete store[key].inputTokens;
+            delete store[key].outputTokens;
+            delete store[key].totalTokens;
+            store[key].updatedAt = Date.now();
+            await saveSessionStore(storePath, store);
+          }
+
+          return {
+            ok: true,
+            payloadJSON: JSON.stringify({
+              ok: true,
+              key,
+              compacted: true,
+              archived,
+              kept: keptLines.length,
+            }),
+          };
         }
         case "chat.history": {
           const params = parseParams();
@@ -1658,7 +2775,7 @@ export async function startGatewayServer(
           ).items;
           const thinkingLevel =
             entry?.thinkingLevel ??
-            loadConfig().inbound?.agent?.thinkingDefault ??
+            loadConfig().agent?.thinkingDefault ??
             "off";
           return {
             ok: true,
@@ -1931,7 +3048,7 @@ export async function startGatewayServer(
         const sessionKeyRaw =
           typeof obj.sessionKey === "string" ? obj.sessionKey.trim() : "";
         const mainKey =
-          (loadConfig().inbound?.session?.mainKey ?? "main").trim() || "main";
+          (loadConfig().session?.mainKey ?? "main").trim() || "main";
         const sessionKey = sessionKeyRaw.length > 0 ? sessionKeyRaw : mainKey;
         const { storePath, store, entry } = loadSessionEntry(sessionKey);
         const now = Date.now();
@@ -1960,7 +3077,7 @@ export async function startGatewayServer(
           defaultRuntime,
           deps,
         ).catch((err) => {
-          logWarn(`bridge: agent failed node=${nodeId}: ${formatForLog(err)}`);
+          logBridge.warn(`agent failed node=${nodeId}: ${formatForLog(err)}`);
         });
         return;
       }
@@ -2035,7 +3152,7 @@ export async function startGatewayServer(
           defaultRuntime,
           deps,
         ).catch((err) => {
-          logWarn(`bridge: agent failed node=${nodeId}: ${formatForLog(err)}`);
+          logBridge.warn(`agent failed node=${nodeId}: ${formatForLog(err)}`);
         });
         return;
       }
@@ -2081,10 +3198,13 @@ export async function startGatewayServer(
   };
 
   const machineDisplayName = await getMachineDisplayName();
-  const bridgeHostIsLoopback = bridgeHost ? isLoopbackHost(bridgeHost) : false;
-  const canvasHostPortForBridge =
-    canvasHost && (!isLoopbackHost(bindHost) || bridgeHostIsLoopback)
-      ? port
+  const canvasHostPortForBridge = canvasHostServer?.port;
+  const canvasHostHostForBridge =
+    canvasHostServer &&
+    bridgeHost &&
+    bridgeHost !== "0.0.0.0" &&
+    bridgeHost !== "::"
+      ? bridgeHost
       : undefined;
 
   if (bridgeEnabled && bridgePort > 0 && bridgeHost) {
@@ -2094,6 +3214,7 @@ export async function startGatewayServer(
         port: bridgePort,
         serverName: machineDisplayName,
         canvasHostPort: canvasHostPortForBridge,
+        canvasHostHost: canvasHostHostForBridge,
         onRequest: (nodeId, req) => handleBridgeRequest(nodeId, req),
         onAuthenticated: async (node) => {
           const host = node.displayName?.trim() || node.nodeId;
@@ -2182,16 +3303,16 @@ export async function startGatewayServer(
       });
       if (started.port > 0) {
         bridge = started;
-        defaultRuntime.log(
-          `bridge listening on tcp://${bridgeHost}:${bridge.port} (node)`,
+        logBridge.info(
+          `listening on tcp://${bridgeHost}:${bridge.port} (node)`,
         );
       }
     } catch (err) {
-      logWarn(`gateway: bridge failed to start: ${String(err)}`);
+      logBridge.warn(`failed to start: ${String(err)}`);
     }
   } else if (bridgeEnabled && bridgePort > 0 && !bridgeHost) {
-    logWarn(
-      "gateway: bridge bind policy requested tailnet IP, but no tailnet interface was found; refusing to start bridge",
+    logBridge.warn(
+      "bind policy requested tailnet IP, but no tailnet interface was found; refusing to start bridge",
     );
   }
 
@@ -2216,14 +3337,14 @@ export async function startGatewayServer(
     });
     bonjourStop = bonjour.stop;
   } catch (err) {
-    logWarn(`gateway: bonjour advertising failed: ${String(err)}`);
+    logDiscovery.warn(`bonjour advertising failed: ${String(err)}`);
   }
 
   if (wideAreaDiscoveryEnabled && bridge?.port) {
     const tailnetIPv4 = pickPrimaryTailnetIPv4();
     if (!tailnetIPv4) {
-      logWarn(
-        "gateway: discovery.wideArea.enabled is true, but no Tailscale IPv4 address was found; skipping unicast DNS-SD zone update",
+      logDiscovery.warn(
+        "discovery.wideArea.enabled is true, but no Tailscale IPv4 address was found; skipping unicast DNS-SD zone update",
       );
     } else {
       try {
@@ -2235,11 +3356,11 @@ export async function startGatewayServer(
           tailnetIPv6: tailnetIPv6 ?? undefined,
           tailnetDns,
         });
-        defaultRuntime.log(
-          `discovery: wide-area DNS-SD ${result.changed ? "updated" : "unchanged"} (${WIDE_AREA_DISCOVERY_DOMAIN} → ${result.zonePath})`,
+        logDiscovery.info(
+          `wide-area DNS-SD ${result.changed ? "updated" : "unchanged"} (${WIDE_AREA_DISCOVERY_DOMAIN} → ${result.zonePath})`,
         );
       } catch (err) {
-        logWarn(`gateway: wide-area discovery update failed: ${String(err)}`);
+        logDiscovery.warn(`wide-area discovery update failed: ${String(err)}`);
       }
     }
   }
@@ -2261,13 +3382,13 @@ export async function startGatewayServer(
   // periodic health refresh to keep cached snapshot warm
   const healthInterval = setInterval(() => {
     void refreshHealthSnapshot({ probe: true }).catch((err) =>
-      logError(`health refresh failed: ${formatError(err)}`),
+      logHealth.error(`refresh failed: ${formatError(err)}`),
     );
   }, HEALTH_REFRESH_INTERVAL_MS);
 
   // Prime cache so first client gets a snapshot without waiting.
   void refreshHealthSnapshot({ probe: true }).catch((err) =>
-    logError(`initial health refresh failed: ${formatError(err)}`),
+    logHealth.error(`initial refresh failed: ${formatError(err)}`),
   );
 
   // dedupe cache cleanup
@@ -2358,7 +3479,9 @@ export async function startGatewayServer(
           const payload = {
             ...base,
             state: "error",
-            errorMessage: evt.data.error ? String(evt.data.error) : undefined,
+            errorMessage: evt.data.error
+              ? formatForLog(evt.data.error)
+              : undefined,
           };
           broadcast("chat", payload);
           bridgeSendToSession(sessionKey, "chat", payload);
@@ -2372,21 +3495,32 @@ export async function startGatewayServer(
     broadcast("heartbeat", evt, { dropIfSlow: true });
   });
 
+  const heartbeatRunner = startHeartbeatRunner({ cfg: cfgAtStart });
+
   void cron
     .start()
-    .catch((err) => logError(`cron failed to start: ${String(err)}`));
+    .catch((err) => logCron.error(`failed to start: ${String(err)}`));
 
-  wss.on("connection", (socket, req) => {
+  wss.on("connection", (socket, upgradeReq) => {
     let client: Client | null = null;
     let closed = false;
     const connId = randomUUID();
     const remoteAddr = (
       socket as WebSocket & { _socket?: { remoteAddress?: string } }
     )._socket?.remoteAddress;
-    const canvasHostUrl = deriveCanvasHostUrl(
-      req,
-      canvasHost ? port : undefined,
-    );
+    const canvasHostPortForWs =
+      canvasHostServer?.port ?? (canvasHost ? port : undefined);
+    const canvasHostOverride =
+      bridgeHost && bridgeHost !== "0.0.0.0" && bridgeHost !== "::"
+        ? bridgeHost
+        : undefined;
+    const canvasHostUrl = resolveCanvasHostUrl({
+      canvasPort: canvasHostPortForWs,
+      hostOverride: canvasHostServer ? canvasHostOverride : undefined,
+      requestHost: upgradeReq.headers.host,
+      forwardedProto: upgradeReq.headers["x-forwarded-proto"],
+      localAddress: upgradeReq.socket?.localAddress,
+    });
     logWs("in", "open", { connId, remoteAddr });
     const isWebchatConnect = (params: ConnectParams | null | undefined) =>
       params?.client?.mode === "webchat" ||
@@ -2413,19 +3547,19 @@ export async function startGatewayServer(
     };
 
     socket.once("error", (err) => {
-      logWarn(
-        `[gws] error conn=${connId} remote=${remoteAddr ?? "?"}: ${formatError(err)}`,
+      logWsControl.warn(
+        `error conn=${connId} remote=${remoteAddr ?? "?"}: ${formatError(err)}`,
       );
       close();
     });
     socket.once("close", (code, reason) => {
       if (!client) {
-        logWarn(
-          `[gws] closed before connect conn=${connId} remote=${remoteAddr ?? "?"} code=${code ?? "n/a"} reason=${reason?.toString() || "n/a"}`,
+        logWsControl.warn(
+          `closed before connect conn=${connId} remote=${remoteAddr ?? "?"} code=${code ?? "n/a"} reason=${reason?.toString() || "n/a"}`,
         );
       }
       if (client && isWebchatConnect(client.connect)) {
-        logInfo(
+        logWsControl.info(
           `webchat disconnected code=${code} reason=${reason?.toString() || "n/a"} conn=${connId}`,
         );
       }
@@ -2454,8 +3588,8 @@ export async function startGatewayServer(
 
     const handshakeTimer = setTimeout(() => {
       if (!client) {
-        logWarn(
-          `[gws] handshake timeout conn=${connId} remote=${remoteAddr ?? "?"}`,
+        logWsControl.warn(
+          `handshake timeout conn=${connId} remote=${remoteAddr ?? "?"}`,
         );
         close();
       }
@@ -2463,7 +3597,7 @@ export async function startGatewayServer(
 
     socket.on("message", async (data) => {
       if (closed) return;
-      const text = data.toString();
+      const text = rawDataToString(data);
       try {
         const parsed = JSON.parse(text);
         if (!client) {
@@ -2488,8 +3622,8 @@ export async function startGatewayServer(
                 ),
               });
             } else {
-              logWarn(
-                `[gws] invalid handshake conn=${connId} remote=${remoteAddr ?? "?"}`,
+              logWsControl.warn(
+                `invalid handshake conn=${connId} remote=${remoteAddr ?? "?"}`,
               );
             }
             socket.close(1008, "invalid handshake");
@@ -2497,8 +3631,8 @@ export async function startGatewayServer(
             return;
           }
 
-          const req = parsed as RequestFrame;
-          const connectParams = req.params as ConnectParams;
+          const frame = parsed as RequestFrame;
+          const connectParams = frame.params as ConnectParams;
 
           // protocol negotiation
           const { minProtocol, maxProtocol } = connectParams;
@@ -2506,12 +3640,12 @@ export async function startGatewayServer(
             maxProtocol < PROTOCOL_VERSION ||
             minProtocol > PROTOCOL_VERSION
           ) {
-            logWarn(
-              `[gws] protocol mismatch conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
+            logWsControl.warn(
+              `protocol mismatch conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
             );
             send({
               type: "res",
-              id: req.id,
+              id: frame.id,
               ok: false,
               error: errorShape(
                 ErrorCodes.INVALID_REQUEST,
@@ -2526,15 +3660,18 @@ export async function startGatewayServer(
             return;
           }
 
-          // token auth if required
-          const token = getGatewayToken();
-          if (token && connectParams.auth?.token !== token) {
-            logWarn(
-              `[gws] unauthorized conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
+          const authResult = await authorizeGatewayConnect({
+            auth: resolvedAuth,
+            connectAuth: connectParams.auth,
+            req: upgradeReq,
+          });
+          if (!authResult.ok) {
+            logWsControl.warn(
+              `unauthorized conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
             );
             send({
               type: "res",
-              id: req.id,
+              id: frame.id,
               ok: false,
               error: errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"),
             });
@@ -2542,6 +3679,7 @@ export async function startGatewayServer(
             close();
             return;
           }
+          const authMethod = authResult.method ?? "none";
 
           const shouldTrackPresence = connectParams.client.mode !== "cli";
           const presenceKey = shouldTrackPresence
@@ -2555,11 +3693,11 @@ export async function startGatewayServer(
             mode: connectParams.client.mode,
             instanceId: connectParams.client.instanceId,
             platform: connectParams.client.platform,
-            token: connectParams.auth?.token ? "set" : "none",
+            auth: authMethod,
           });
 
           if (isWebchatConnect(connectParams)) {
-            logInfo(
+            logWsControl.info(
               `webchat connected conn=${connId} remote=${remoteAddr ?? "?"} client=${connectParams.client.name} ${connectParams.client.mode} v${connectParams.client.version}`,
             );
           }
@@ -2617,11 +3755,13 @@ export async function startGatewayServer(
             stateVersion: snapshot.stateVersion.presence,
           });
 
-          send({ type: "res", id: req.id, ok: true, payload: helloOk });
+          send({ type: "res", id: frame.id, ok: true, payload: helloOk });
 
           clients.add(client);
           void refreshHealthSnapshot({ probe: true }).catch((err) =>
-            logError(`post-connect health refresh failed: ${formatError(err)}`),
+            logHealth.error(
+              `post-connect health refresh failed: ${formatError(err)}`,
+            ),
           );
           return;
         }
@@ -2722,7 +3862,7 @@ export async function startGatewayServer(
               if (cached && now - cached.ts < HEALTH_REFRESH_INTERVAL_MS) {
                 respond(true, cached, undefined, { cached: true });
                 void refreshHealthSnapshot({ probe: false }).catch((err) =>
-                  logError(
+                  logHealth.error(
                     `background health refresh failed: ${formatError(err)}`,
                   ),
                 );
@@ -2738,6 +3878,109 @@ export async function startGatewayServer(
                   errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)),
                 );
               }
+              break;
+            }
+            case "providers.status": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateProvidersStatusParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid providers.status params: ${formatValidationErrors(validateProvidersStatusParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              const probe = (params as { probe?: boolean }).probe === true;
+              const timeoutMsRaw = (params as { timeoutMs?: unknown })
+                .timeoutMs;
+              const timeoutMs =
+                typeof timeoutMsRaw === "number"
+                  ? Math.max(1000, timeoutMsRaw)
+                  : 10_000;
+              const cfg = loadConfig();
+              const envToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+              const configToken = cfg.telegram?.botToken?.trim();
+              const telegramToken = envToken || configToken || "";
+              const tokenSource = envToken
+                ? "env"
+                : configToken
+                  ? "config"
+                  : "none";
+              let telegramProbe: TelegramProbe | undefined;
+              let lastProbeAt: number | null = null;
+              if (probe && telegramToken) {
+                telegramProbe = await probeTelegram(
+                  telegramToken,
+                  timeoutMs,
+                  cfg.telegram?.proxy,
+                );
+                lastProbeAt = Date.now();
+              }
+
+              const discordEnvToken = process.env.DISCORD_BOT_TOKEN?.trim();
+              const discordConfigToken = cfg.discord?.token?.trim();
+              const discordToken = discordEnvToken || discordConfigToken || "";
+              const discordTokenSource = discordEnvToken
+                ? "env"
+                : discordConfigToken
+                  ? "config"
+                  : "none";
+              let discordProbe: DiscordProbe | undefined;
+              let discordLastProbeAt: number | null = null;
+              if (probe && discordToken) {
+                discordProbe = await probeDiscord(discordToken, timeoutMs);
+                discordLastProbeAt = Date.now();
+              }
+
+              const linked = await webAuthExists();
+              const authAgeMs = getWebAuthAgeMs();
+              const self = readWebSelfId();
+
+              respond(
+                true,
+                {
+                  ts: Date.now(),
+                  whatsapp: {
+                    configured: linked,
+                    linked,
+                    authAgeMs,
+                    self,
+                    running: whatsappRuntime.running,
+                    connected: whatsappRuntime.connected,
+                    lastConnectedAt: whatsappRuntime.lastConnectedAt ?? null,
+                    lastDisconnect: whatsappRuntime.lastDisconnect ?? null,
+                    reconnectAttempts: whatsappRuntime.reconnectAttempts,
+                    lastMessageAt: whatsappRuntime.lastMessageAt ?? null,
+                    lastEventAt: whatsappRuntime.lastEventAt ?? null,
+                    lastError: whatsappRuntime.lastError ?? null,
+                  },
+                  telegram: {
+                    configured: Boolean(telegramToken),
+                    tokenSource,
+                    running: telegramRuntime.running,
+                    mode: telegramRuntime.mode ?? null,
+                    lastStartAt: telegramRuntime.lastStartAt ?? null,
+                    lastStopAt: telegramRuntime.lastStopAt ?? null,
+                    lastError: telegramRuntime.lastError ?? null,
+                    probe: telegramProbe,
+                    lastProbeAt,
+                  },
+                  discord: {
+                    configured: Boolean(discordToken),
+                    tokenSource: discordTokenSource,
+                    running: discordRuntime.running,
+                    lastStartAt: discordRuntime.lastStartAt ?? null,
+                    lastStopAt: discordRuntime.lastStopAt ?? null,
+                    lastError: discordRuntime.lastError ?? null,
+                    probe: discordProbe,
+                    lastProbeAt: discordLastProbeAt,
+                  },
+                },
+                undefined,
+              );
               break;
             }
             case "chat.history": {
@@ -2778,7 +4021,7 @@ export async function startGatewayServer(
               ).items;
               const thinkingLevel =
                 entry?.thinkingLevel ??
-                loadConfig().inbound?.agent?.thinkingDefault ??
+                loadConfig().agent?.thinkingDefault ??
                 "off";
               respond(true, {
                 sessionKey,
@@ -3164,6 +4407,164 @@ export async function startGatewayServer(
               respond(true, status, undefined);
               break;
             }
+            case "web.login.start": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateWebLoginStartParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid web.login.start params: ${formatValidationErrors(validateWebLoginStartParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              try {
+                await stopWhatsAppProvider();
+                const result = await startWebLoginWithQr({
+                  force: Boolean((params as { force?: boolean }).force),
+                  timeoutMs:
+                    typeof (params as { timeoutMs?: unknown }).timeoutMs ===
+                    "number"
+                      ? (params as { timeoutMs?: number }).timeoutMs
+                      : undefined,
+                  verbose: Boolean((params as { verbose?: boolean }).verbose),
+                });
+                respond(true, result, undefined);
+              } catch (err) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)),
+                );
+              }
+              break;
+            }
+            case "web.login.wait": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateWebLoginWaitParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid web.login.wait params: ${formatValidationErrors(validateWebLoginWaitParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              try {
+                const result = await waitForWebLogin({
+                  timeoutMs:
+                    typeof (params as { timeoutMs?: unknown }).timeoutMs ===
+                    "number"
+                      ? (params as { timeoutMs?: number }).timeoutMs
+                      : undefined,
+                });
+                if (result.connected) {
+                  await startWhatsAppProvider();
+                }
+                respond(true, result, undefined);
+              } catch (err) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)),
+                );
+              }
+              break;
+            }
+            case "web.logout": {
+              try {
+                await stopWhatsAppProvider();
+                const cleared = await logoutWeb(defaultRuntime);
+                whatsappRuntime = {
+                  ...whatsappRuntime,
+                  running: false,
+                  connected: false,
+                  lastError: cleared ? "logged out" : whatsappRuntime.lastError,
+                };
+                respond(true, { cleared }, undefined);
+              } catch (err) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)),
+                );
+              }
+              break;
+            }
+            case "telegram.logout": {
+              try {
+                await stopTelegramProvider();
+                const snapshot = await readConfigFileSnapshot();
+                if (!snapshot.valid) {
+                  respond(
+                    false,
+                    undefined,
+                    errorShape(
+                      ErrorCodes.INVALID_REQUEST,
+                      "config invalid; fix it before logging out",
+                    ),
+                  );
+                  break;
+                }
+                const cfg = snapshot.config ?? {};
+                const envToken = process.env.TELEGRAM_BOT_TOKEN?.trim() ?? "";
+                const hadToken = Boolean(cfg.telegram?.botToken);
+                const nextTelegram = cfg.telegram
+                  ? { ...cfg.telegram }
+                  : undefined;
+                if (nextTelegram) {
+                  delete nextTelegram.botToken;
+                }
+                const nextCfg = { ...cfg } as ClawdisConfig;
+                if (nextTelegram && Object.keys(nextTelegram).length > 0) {
+                  nextCfg.telegram = nextTelegram;
+                } else {
+                  delete nextCfg.telegram;
+                }
+                await writeConfigFile(nextCfg);
+                respond(
+                  true,
+                  { cleared: hadToken, envToken: Boolean(envToken) },
+                  undefined,
+                );
+              } catch (err) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)),
+                );
+              }
+              break;
+            }
+            case "models.list": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateModelsListParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid models.list params: ${formatValidationErrors(validateModelsListParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              try {
+                const models = await loadGatewayModelCatalog();
+                respond(true, { models }, undefined);
+              } catch (err) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.UNAVAILABLE, String(err)),
+                );
+              }
+              break;
+            }
             case "config.get": {
               const params = (req.params ?? {}) as Record<string, unknown>;
               if (!validateConfigGetParams(params)) {
@@ -3194,8 +4595,19 @@ export async function startGatewayServer(
                 );
                 break;
               }
-              const raw = String((params as { raw?: unknown }).raw ?? "");
-              const parsedRes = parseConfigJson5(raw);
+              const rawValue = (params as { raw?: unknown }).raw;
+              if (typeof rawValue !== "string") {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    "invalid config.set params: raw (string) required",
+                  ),
+                );
+                break;
+              }
+              const parsedRes = parseConfigJson5(rawValue);
               if (!parsedRes.ok) {
                 respond(
                   false,
@@ -3242,7 +4654,7 @@ export async function startGatewayServer(
               }
               const cfg = loadConfig();
               const workspaceDirRaw =
-                cfg.inbound?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
+                cfg.agent?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
               const workspaceDir = resolveUserPath(workspaceDirRaw);
               const report = buildWorkspaceSkillStatus(workspaceDir, {
                 config: cfg,
@@ -3270,7 +4682,7 @@ export async function startGatewayServer(
               };
               const cfg = loadConfig();
               const workspaceDirRaw =
-                cfg.inbound?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
+                cfg.agent?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
               const result = await installSkill({
                 workspaceDir: workspaceDirRaw,
                 skillName: p.name,
@@ -3307,8 +4719,10 @@ export async function startGatewayServer(
                 env?: Record<string, string>;
               };
               const cfg = loadConfig();
-              const skills = { ...(cfg.skills ?? {}) };
-              const current = { ...(skills[p.skillKey] ?? {}) };
+              const skills = cfg.skills ? { ...cfg.skills } : {};
+              const current = skills[p.skillKey]
+                ? { ...skills[p.skillKey] }
+                : {};
               if (typeof p.enabled === "boolean") {
                 current.enabled = p.enabled;
               }
@@ -3318,11 +4732,11 @@ export async function startGatewayServer(
                 else delete current.apiKey;
               }
               if (p.env && typeof p.env === "object") {
-                const nextEnv = { ...(current.env ?? {}) };
+                const nextEnv = current.env ? { ...current.env } : {};
                 for (const [key, value] of Object.entries(p.env)) {
                   const trimmedKey = key.trim();
                   if (!trimmedKey) continue;
-                  const trimmedVal = String(value ?? "").trim();
+                  const trimmedVal = value.trim();
                   if (!trimmedVal) delete nextEnv[trimmedKey];
                   else nextEnv[trimmedKey] = trimmedVal;
                 }
@@ -3356,7 +4770,7 @@ export async function startGatewayServer(
               }
               const p = params as SessionsListParams;
               const cfg = loadConfig();
-              const storePath = resolveStorePath(cfg.inbound?.session?.store);
+              const storePath = resolveStorePath(cfg.session?.store);
               const store = loadSessionStore(storePath);
               const result = listSessionsFromStore({
                 cfg,
@@ -3392,7 +4806,7 @@ export async function startGatewayServer(
               }
 
               const cfg = loadConfig();
-              const storePath = resolveStorePath(cfg.inbound?.session?.store);
+              const storePath = resolveStorePath(cfg.session?.store);
               const store = loadSessionStore(storePath);
               const now = Date.now();
 
@@ -3448,6 +4862,27 @@ export async function startGatewayServer(
                 }
               }
 
+              if ("groupActivation" in p) {
+                const raw = p.groupActivation;
+                if (raw === null) {
+                  delete next.groupActivation;
+                } else if (raw !== undefined) {
+                  const normalized = normalizeGroupActivation(String(raw));
+                  if (!normalized) {
+                    respond(
+                      false,
+                      undefined,
+                      errorShape(
+                        ErrorCodes.INVALID_REQUEST,
+                        'invalid groupActivation (use "mention"|"always")',
+                      ),
+                    );
+                    break;
+                  }
+                  next.groupActivation = normalized;
+                }
+              }
+
               store[key] = next;
               await saveSessionStore(storePath, store);
               const result: SessionsPatchResult = {
@@ -3457,6 +4892,198 @@ export async function startGatewayServer(
                 entry: next,
               };
               respond(true, result, undefined);
+              break;
+            }
+            case "sessions.reset": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateSessionsResetParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid sessions.reset params: ${formatValidationErrors(validateSessionsResetParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              const p = params as SessionsResetParams;
+              const key = String(p.key ?? "").trim();
+              if (!key) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.INVALID_REQUEST, "key required"),
+                );
+                break;
+              }
+
+              const { storePath, store, entry } = loadSessionEntry(key);
+              const now = Date.now();
+              const next: SessionEntry = {
+                sessionId: randomUUID(),
+                updatedAt: now,
+                systemSent: false,
+                abortedLastRun: false,
+                thinkingLevel: entry?.thinkingLevel,
+                verboseLevel: entry?.verboseLevel,
+                model: entry?.model,
+                contextTokens: entry?.contextTokens,
+                lastChannel: entry?.lastChannel,
+                lastTo: entry?.lastTo,
+                skillsSnapshot: entry?.skillsSnapshot,
+              };
+              store[key] = next;
+              await saveSessionStore(storePath, store);
+              respond(true, { ok: true, key, entry: next }, undefined);
+              break;
+            }
+            case "sessions.delete": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateSessionsDeleteParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid sessions.delete params: ${formatValidationErrors(validateSessionsDeleteParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              const p = params as SessionsDeleteParams;
+              const key = String(p.key ?? "").trim();
+              if (!key) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.INVALID_REQUEST, "key required"),
+                );
+                break;
+              }
+
+              const deleteTranscript =
+                typeof p.deleteTranscript === "boolean"
+                  ? p.deleteTranscript
+                  : true;
+
+              const { storePath, store, entry } = loadSessionEntry(key);
+              const sessionId = entry?.sessionId;
+              const existed = Boolean(store[key]);
+              if (existed) delete store[key];
+              await saveSessionStore(storePath, store);
+
+              const archived: string[] = [];
+              if (deleteTranscript && sessionId) {
+                for (const candidate of resolveSessionTranscriptCandidates(
+                  sessionId,
+                  storePath,
+                )) {
+                  if (!fs.existsSync(candidate)) continue;
+                  try {
+                    archived.push(archiveFileOnDisk(candidate, "deleted"));
+                  } catch {
+                    // Best-effort.
+                  }
+                }
+              }
+
+              respond(
+                true,
+                { ok: true, key, deleted: existed, archived },
+                undefined,
+              );
+              break;
+            }
+            case "sessions.compact": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateSessionsCompactParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid sessions.compact params: ${formatValidationErrors(validateSessionsCompactParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              const p = params as SessionsCompactParams;
+              const key = String(p.key ?? "").trim();
+              if (!key) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.INVALID_REQUEST, "key required"),
+                );
+                break;
+              }
+
+              const maxLines =
+                typeof p.maxLines === "number" && Number.isFinite(p.maxLines)
+                  ? Math.max(1, Math.floor(p.maxLines))
+                  : 400;
+
+              const { storePath, store, entry } = loadSessionEntry(key);
+              const sessionId = entry?.sessionId;
+              if (!sessionId) {
+                respond(
+                  true,
+                  { ok: true, key, compacted: false, reason: "no sessionId" },
+                  undefined,
+                );
+                break;
+              }
+
+              const filePath = resolveSessionTranscriptCandidates(
+                sessionId,
+                storePath,
+              ).find((candidate) => fs.existsSync(candidate));
+              if (!filePath) {
+                respond(
+                  true,
+                  { ok: true, key, compacted: false, reason: "no transcript" },
+                  undefined,
+                );
+                break;
+              }
+
+              const raw = fs.readFileSync(filePath, "utf-8");
+              const lines = raw
+                .split(/\r?\n/)
+                .filter((l) => l.trim().length > 0);
+              if (lines.length <= maxLines) {
+                respond(
+                  true,
+                  { ok: true, key, compacted: false, kept: lines.length },
+                  undefined,
+                );
+                break;
+              }
+
+              const archived = archiveFileOnDisk(filePath, "bak");
+              const keptLines = lines.slice(-maxLines);
+              fs.writeFileSync(filePath, `${keptLines.join("\n")}\n`, "utf-8");
+
+              if (store[key]) {
+                delete store[key].inputTokens;
+                delete store[key].outputTokens;
+                delete store[key].totalTokens;
+                store[key].updatedAt = Date.now();
+                await saveSessionStore(storePath, store);
+              }
+
+              respond(
+                true,
+                {
+                  ok: true,
+                  key,
+                  compacted: true,
+                  archived,
+                  kept: keptLines.length,
+                },
+                undefined,
+              );
               break;
             }
             case "last-heartbeat": {
@@ -3488,7 +5115,8 @@ export async function startGatewayServer(
             }
             case "system-event": {
               const params = (req.params ?? {}) as Record<string, unknown>;
-              const text = String(params.text ?? "").trim();
+              const text =
+                typeof params.text === "string" ? params.text.trim() : "";
               if (!text) {
                 respond(
                   false,
@@ -3532,7 +5160,7 @@ export async function startGatewayServer(
                 params.tags.every((t) => typeof t === "string")
                   ? (params.tags as string[])
                   : undefined;
-              updateSystemPresence({
+              const presenceUpdate = updateSystemPresence({
                 text,
                 instanceId,
                 host,
@@ -3547,17 +5175,55 @@ export async function startGatewayServer(
                 tags,
               });
               const isNodePresenceLine = text.startsWith("Node:");
-              const normalizedReason = (reason ?? "").toLowerCase();
-              const looksPeriodic =
-                normalizedReason.startsWith("periodic") ||
-                normalizedReason === "heartbeat";
-              if (!(isNodePresenceLine && looksPeriodic)) {
-                const compactNodeText =
-                  isNodePresenceLine &&
-                  (host || ip || version || mode || reason)
-                    ? `Node: ${host?.trim() || "Unknown"}${ip ? ` (${ip})` : ""} · app ${version?.trim() || "unknown"} · mode ${mode?.trim() || "unknown"} · reason ${reason?.trim() || "event"}`
-                    : text;
-                enqueueSystemEvent(compactNodeText);
+              if (isNodePresenceLine) {
+                const next = presenceUpdate.next;
+                const changed = new Set(presenceUpdate.changedKeys);
+                const reasonValue = next.reason ?? reason;
+                const normalizedReason = (reasonValue ?? "").toLowerCase();
+                const ignoreReason =
+                  normalizedReason.startsWith("periodic") ||
+                  normalizedReason === "heartbeat";
+                const hostChanged = changed.has("host");
+                const ipChanged = changed.has("ip");
+                const versionChanged = changed.has("version");
+                const modeChanged = changed.has("mode");
+                const reasonChanged = changed.has("reason") && !ignoreReason;
+                const hasChanges =
+                  hostChanged ||
+                  ipChanged ||
+                  versionChanged ||
+                  modeChanged ||
+                  reasonChanged;
+                if (hasChanges) {
+                  const contextChanged = isSystemEventContextChanged(
+                    presenceUpdate.key,
+                  );
+                  const parts: string[] = [];
+                  if (contextChanged || hostChanged || ipChanged) {
+                    const hostLabel = next.host?.trim() || "Unknown";
+                    const ipLabel = next.ip?.trim();
+                    parts.push(
+                      `Node: ${hostLabel}${ipLabel ? ` (${ipLabel})` : ""}`,
+                    );
+                  }
+                  if (versionChanged) {
+                    parts.push(`app ${next.version?.trim() || "unknown"}`);
+                  }
+                  if (modeChanged) {
+                    parts.push(`mode ${next.mode?.trim() || "unknown"}`);
+                  }
+                  if (reasonChanged) {
+                    parts.push(`reason ${reasonValue?.trim() || "event"}`);
+                  }
+                  const deltaText = parts.join(" · ");
+                  if (deltaText) {
+                    enqueueSystemEvent(deltaText, {
+                      contextKey: presenceUpdate.key,
+                    });
+                  }
+                }
+              } else {
+                enqueueSystemEvent(text);
               }
               presenceVersion += 1;
               broadcast(
@@ -3760,6 +5426,59 @@ export async function startGatewayServer(
               try {
                 const result = await verifyNodeToken(nodeId, token);
                 respond(true, result, undefined);
+              } catch (err) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)),
+                );
+              }
+              break;
+            }
+            case "node.rename": {
+              const params = (req.params ?? {}) as Record<string, unknown>;
+              if (!validateNodeRenameParams(params)) {
+                respond(
+                  false,
+                  undefined,
+                  errorShape(
+                    ErrorCodes.INVALID_REQUEST,
+                    `invalid node.rename params: ${formatValidationErrors(validateNodeRenameParams.errors)}`,
+                  ),
+                );
+                break;
+              }
+              const { nodeId, displayName } = params as {
+                nodeId: string;
+                displayName: string;
+              };
+              try {
+                const trimmed = displayName.trim();
+                if (!trimmed) {
+                  respond(
+                    false,
+                    undefined,
+                    errorShape(
+                      ErrorCodes.INVALID_REQUEST,
+                      "displayName required",
+                    ),
+                  );
+                  break;
+                }
+                const updated = await renamePairedNode(nodeId, trimmed);
+                if (!updated) {
+                  respond(
+                    false,
+                    undefined,
+                    errorShape(ErrorCodes.INVALID_REQUEST, "unknown nodeId"),
+                  );
+                  break;
+                }
+                respond(
+                  true,
+                  { nodeId: updated.nodeId, displayName: updated.displayName },
+                  undefined,
+                );
               } catch (err) {
                 respond(
                   false,
@@ -4083,6 +5802,23 @@ export async function startGatewayServer(
                     payload,
                   });
                   respond(true, payload, undefined, { provider });
+                } else if (provider === "discord") {
+                  const result = await sendMessageDiscord(to, message, {
+                    mediaUrl: params.mediaUrl,
+                    token: process.env.DISCORD_BOT_TOKEN,
+                  });
+                  const payload = {
+                    runId: idem,
+                    messageId: result.messageId,
+                    channelId: result.channelId,
+                    provider,
+                  };
+                  dedupe.set(`send:${idem}`, {
+                    ts: Date.now(),
+                    ok: true,
+                    payload,
+                  });
+                  respond(true, payload, undefined, { provider });
                 } else {
                   const result = await sendMessageWhatsApp(to, message, {
                     mediaUrl: params.mediaUrl,
@@ -4183,7 +5919,7 @@ export async function startGatewayServer(
                 }
                 resolvedSessionId = sessionId;
                 const mainKey =
-                  (cfg.inbound?.session?.mainKey ?? "main").trim() || "main";
+                  (cfg.session?.mainKey ?? "main").trim() || "main";
                 if (requestedSessionKey === mainKey) {
                   chatRunSessions.set(sessionId, {
                     sessionKey: requestedSessionKey,
@@ -4218,6 +5954,7 @@ export async function startGatewayServer(
                 if (
                   requestedChannel === "whatsapp" ||
                   requestedChannel === "telegram" ||
+                  requestedChannel === "discord" ||
                   requestedChannel === "webchat"
                 ) {
                   return requestedChannel;
@@ -4235,7 +5972,8 @@ export async function startGatewayServer(
                 if (explicit) return explicit;
                 if (
                   resolvedChannel === "whatsapp" ||
-                  resolvedChannel === "telegram"
+                  resolvedChannel === "telegram" ||
+                  resolvedChannel === "discord"
                 ) {
                   return lastTo || undefined;
                 }
@@ -4254,7 +5992,7 @@ export async function startGatewayServer(
                 if (explicit) return resolvedTo;
 
                 const cfg = cfgForAgent ?? loadConfig();
-                const rawAllow = cfg.inbound?.allowFrom ?? [];
+                const rawAllow = cfg.routing?.allowFrom ?? [];
                 if (rawAllow.includes("*")) return resolvedTo;
                 const allowFrom = rawAllow
                   .map((val) => normalizeE164(val))
@@ -4346,7 +6084,7 @@ export async function startGatewayServer(
             }
           }
         })().catch((err) => {
-          logError(`gateway: request handler failed: ${formatForLog(err)}`);
+          log.error(`request handler failed: ${formatForLog(err)}`);
           respond(
             false,
             undefined,
@@ -4354,7 +6092,7 @@ export async function startGatewayServer(
           );
         });
       } catch (err) {
-        logError(`gateway: parse/handle error: ${String(err)}`);
+        log.error(`parse/handle error: ${String(err)}`);
         logWs("out", "parse-error", { connId, error: formatForLog(err) });
         // If still in handshake, close; otherwise respond error
         if (!client) {
@@ -4364,28 +6102,88 @@ export async function startGatewayServer(
     });
   });
 
-  defaultRuntime.log(
-    `gateway listening on ws://${bindHost}:${port} (PID ${process.pid})`,
-  );
-  defaultRuntime.log(`gateway log file: ${getResolvedLoggerSettings().file}`);
+  const { provider: agentProvider, model: agentModel } =
+    resolveConfiguredModelRef({
+      cfg: cfgAtStart,
+      defaultProvider: DEFAULT_PROVIDER,
+      defaultModel: DEFAULT_MODEL,
+    });
+  const modelRef = `${agentProvider}/${agentModel}`;
+  log.info(`agent model: ${modelRef}`, {
+    consoleMessage: `agent model: ${chalk.whiteBright(modelRef)}`,
+  });
+  log.info(`listening on ws://${bindHost}:${port} (PID ${process.pid})`);
+  log.info(`log file: ${getResolvedLoggerSettings().file}`);
+  if (isNixMode) {
+    log.info("gateway: running in Nix mode (config managed externally)");
+  }
+  let tailscaleCleanup: (() => Promise<void>) | null = null;
+  if (tailscaleMode !== "off") {
+    try {
+      if (tailscaleMode === "serve") {
+        await enableTailscaleServe(port);
+      } else {
+        await enableTailscaleFunnel(port);
+      }
+      const host = await getTailnetHostname().catch(() => null);
+      if (host) {
+        logTailscale.info(
+          `${tailscaleMode} enabled: https://${host}/ui/ (WS via wss://${host})`,
+        );
+      } else {
+        logTailscale.info(`${tailscaleMode} enabled`);
+      }
+    } catch (err) {
+      logTailscale.warn(
+        `${tailscaleMode} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (tailscaleConfig.resetOnExit) {
+      tailscaleCleanup = async () => {
+        try {
+          if (tailscaleMode === "serve") {
+            await disableTailscaleServe();
+          } else {
+            await disableTailscaleFunnel();
+          }
+        } catch (err) {
+          logTailscale.warn(
+            `${tailscaleMode} cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      };
+    }
+  }
 
   // Start clawd browser control server (unless disabled via config).
-  void startBrowserControlServerIfEnabled().catch((err) => {
-    logError(`gateway: clawd browser server failed to start: ${String(err)}`);
-  });
+  try {
+    await startBrowserControlServerIfEnabled();
+  } catch (err) {
+    logBrowser.error(`server failed to start: ${String(err)}`);
+  }
 
-  // Launch configured providers (WhatsApp Web, Telegram) so gateway replies via the
+  // Launch configured providers (WhatsApp Web, Discord, Telegram) so gateway replies via the
   // surface the message came from. Tests can opt out via CLAWDIS_SKIP_PROVIDERS.
   if (process.env.CLAWDIS_SKIP_PROVIDERS !== "1") {
-    void startProviders();
+    try {
+      await startProviders();
+    } catch (err) {
+      logProviders.error(`provider startup failed: ${String(err)}`);
+    }
   } else {
-    defaultRuntime.log(
-      "gateway: skipping provider start (CLAWDIS_SKIP_PROVIDERS=1)",
-    );
+    logProviders.info("skipping provider start (CLAWDIS_SKIP_PROVIDERS=1)");
   }
 
   return {
-    close: async () => {
+    close: async (opts) => {
+      const reasonRaw =
+        typeof opts?.reason === "string" ? opts.reason.trim() : "";
+      const reason = reasonRaw || "gateway stopping";
+      const restartExpectedMs =
+        typeof opts?.restartExpectedMs === "number" &&
+        Number.isFinite(opts.restartExpectedMs)
+          ? Math.max(0, Math.floor(opts.restartExpectedMs))
+          : null;
       if (bonjourStop) {
         try {
           await bonjourStop();
@@ -4393,9 +6191,19 @@ export async function startGatewayServer(
           /* ignore */
         }
       }
+      if (tailscaleCleanup) {
+        await tailscaleCleanup();
+      }
       if (canvasHost) {
         try {
           await canvasHost.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      if (canvasHostServer) {
+        try {
+          await canvasHostServer.close();
         } catch {
           /* ignore */
         }
@@ -4407,11 +6215,14 @@ export async function startGatewayServer(
           /* ignore */
         }
       }
-      providerAbort.abort();
+      await stopWhatsAppProvider();
+      await stopTelegramProvider();
+      await stopDiscordProvider();
       cron.stop();
+      heartbeatRunner.stop();
       broadcast("shutdown", {
-        reason: "gateway stopping",
-        restartExpectedMs: null,
+        reason,
+        restartExpectedMs,
       });
       clearInterval(tickInterval);
       clearInterval(healthInterval);
@@ -4443,7 +6254,9 @@ export async function startGatewayServer(
       if (stopBrowserControlServerIfStarted) {
         await stopBrowserControlServerIfStarted().catch(() => {});
       }
-      await Promise.allSettled(providerTasks);
+      await Promise.allSettled(
+        [whatsappTask, telegramTask].filter(Boolean) as Array<Promise<unknown>>,
+      );
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       await new Promise<void>((resolve, reject) =>
         httpServer.close((err) => (err ? reject(err) : resolve())),

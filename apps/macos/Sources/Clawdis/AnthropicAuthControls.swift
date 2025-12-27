@@ -6,7 +6,7 @@ import SwiftUI
 struct AnthropicAuthControls: View {
     let connectionMode: AppState.ConnectionMode
 
-    @State private var oauthStatus: PiOAuthStore.AnthropicOAuthStatus = PiOAuthStore.anthropicOAuthStatus()
+    @State private var oauthStatus: ClawdisOAuthStore.AnthropicOAuthStatus = ClawdisOAuthStore.anthropicOAuthStatus()
     @State private var pkce: AnthropicOAuth.PKCE?
     @State private var code: String = ""
     @State private var busy = false
@@ -15,12 +15,19 @@ struct AnthropicAuthControls: View {
     @State private var autoConnectClipboard = true
     @State private var lastPasteboardChangeCount = NSPasteboard.general.changeCount
 
-    private static let clipboardPoll = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+    private static let clipboardPoll: AnyPublisher<Date, Never> = {
+        if ProcessInfo.processInfo.isRunningTests {
+            return Empty(completeImmediately: false).eraseToAnyPublisher()
+        }
+        return Timer.publish(every: 0.4, on: .main, in: .common)
+            .autoconnect()
+            .eraseToAnyPublisher()
+    }()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if self.connectionMode != .local {
-                Text("Gateway isn’t running locally; OAuth must be created on the gateway host where Pi runs.")
+                Text("Gateway isn’t running locally; OAuth must be created on the gateway host.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -35,10 +42,10 @@ struct AnthropicAuthControls: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Reveal") {
-                    NSWorkspace.shared.activateFileViewerSelecting([PiOAuthStore.oauthURL()])
+                    NSWorkspace.shared.activateFileViewerSelecting([ClawdisOAuthStore.oauthURL()])
                 }
                 .buttonStyle(.bordered)
-                .disabled(!FileManager.default.fileExists(atPath: PiOAuthStore.oauthURL().path))
+                .disabled(!FileManager.default.fileExists(atPath: ClawdisOAuthStore.oauthURL().path))
 
                 Button("Refresh") {
                     self.refresh()
@@ -46,7 +53,7 @@ struct AnthropicAuthControls: View {
                 .buttonStyle(.bordered)
             }
 
-            Text(PiOAuthStore.oauthURL().path)
+            Text(ClawdisOAuthStore.oauthURL().path)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -123,7 +130,11 @@ struct AnthropicAuthControls: View {
     }
 
     private func refresh() {
-        self.oauthStatus = PiOAuthStore.anthropicOAuthStatus()
+        let imported = ClawdisOAuthStore.importLegacyAnthropicOAuthIfNeeded()
+        self.oauthStatus = ClawdisOAuthStore.anthropicOAuthStatus()
+        if imported != nil {
+            self.statusText = "Imported existing OAuth credentials."
+        }
     }
 
     private func startOAuth() {
@@ -161,11 +172,11 @@ struct AnthropicAuthControls: View {
                 code: parsed.code,
                 state: parsed.state,
                 verifier: pkce.verifier)
-            try PiOAuthStore.saveAnthropicOAuth(creds)
+            try ClawdisOAuthStore.saveAnthropicOAuth(creds)
             self.refresh()
             self.pkce = nil
             self.code = ""
-            self.statusText = "Connected. Pi can now use Claude via OAuth."
+            self.statusText = "Connected. Clawdis can now use Claude via OAuth."
         } catch {
             self.statusText = "OAuth failed: \(error.localizedDescription)"
         }
@@ -196,3 +207,28 @@ struct AnthropicAuthControls: View {
         Task { await self.finishOAuth() }
     }
 }
+
+#if DEBUG
+extension AnthropicAuthControls {
+    init(
+        connectionMode: AppState.ConnectionMode,
+        oauthStatus: ClawdisOAuthStore.AnthropicOAuthStatus,
+        pkce: AnthropicOAuth.PKCE? = nil,
+        code: String = "",
+        busy: Bool = false,
+        statusText: String? = nil,
+        autoDetectClipboard: Bool = true,
+        autoConnectClipboard: Bool = true)
+    {
+        self.connectionMode = connectionMode
+        self._oauthStatus = State(initialValue: oauthStatus)
+        self._pkce = State(initialValue: pkce)
+        self._code = State(initialValue: code)
+        self._busy = State(initialValue: busy)
+        self._statusText = State(initialValue: statusText)
+        self._autoDetectClipboard = State(initialValue: autoDetectClipboard)
+        self._autoConnectClipboard = State(initialValue: autoConnectClipboard)
+        self._lastPasteboardChangeCount = State(initialValue: NSPasteboard.general.changeCount)
+    }
+}
+#endif

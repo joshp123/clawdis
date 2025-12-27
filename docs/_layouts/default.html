@@ -51,16 +51,14 @@
           </div>
 
           <div class="titlebar__actions">
-	            <button
-	              class="theme-toggle"
-	              type="button"
-	              data-theme-toggle
-	              aria-label="Toggle theme (F2; on Mac: fn+F2)"
-	              aria-pressed="false"
-	            >
-	              <span class="theme-toggle__key">F2</span>
-	              <span class="theme-toggle__label" data-theme-label>theme</span>
-            </button>
+            <a class="titlebar__cta" href="https://github.com/steipete/clawdis">
+              <span class="titlebar__cta-label">GitHub</span>
+              <span class="titlebar__cta-meta">repo</span>
+            </a>
+            <a class="titlebar__cta titlebar__cta--accent" href="https://github.com/steipete/clawdis/releases/latest">
+              <span class="titlebar__cta-label">Download</span>
+              <span class="titlebar__cta-meta">latest</span>
+            </a>
           </div>
         </div>
 
@@ -124,10 +122,22 @@
             <span class="footer__sep">·</span>
             <a href="https://github.com/steipete/clawdis/releases">releases</a>
           </div>
-	          <div class="footer__hint" aria-hidden="true">
-	            tip: press <kbd>F2</kbd> (Mac: <kbd>fn</kbd>+<kbd>F2</kbd>) to flip
-	            the universe
-	          </div>
+          <div class="footer__hint" aria-hidden="true">
+            tip: press <kbd>F2</kbd> (Mac: <kbd>fn</kbd>+<kbd>F2</kbd>) to flip
+            the universe
+          </div>
+          <div class="footer__actions">
+            <button
+              class="theme-toggle"
+              type="button"
+              data-theme-toggle
+              aria-label="Toggle theme (F2; on Mac: fn+F2)"
+              aria-pressed="false"
+            >
+              <span class="theme-toggle__key">F2</span>
+              <span class="theme-toggle__label" data-theme-label>theme</span>
+            </button>
+          </div>
 	        </footer>
 	      </div>
 	    </main>

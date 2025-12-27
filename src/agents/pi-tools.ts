@@ -1,10 +1,17 @@
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-ai";
-import { bashTool, codingTools, readTool } from "@mariozechner/pi-coding-agent";
-import { Type, type TSchema } from "@sinclair/typebox";
+import { codingTools, readTool } from "@mariozechner/pi-coding-agent";
+import { type TSchema, Type } from "@sinclair/typebox";
 
-import { getImageMetadata, resizeToJpeg } from "../media/image-ops.js";
 import { detectMime } from "../media/mime.js";
 import { startWebLoginWithQr, waitForWebLogin } from "../web/login-qr.js";
+import {
+  type BashToolDefaults,
+  createBashTool,
+  createProcessTool,
+  type ProcessToolDefaults,
+} from "./bash-tools.js";
+import { createClawdisTools } from "./clawdis-tools.js";
+import { sanitizeToolResultImages } from "./tool-images.js";
 
 // TODO(steipete): Remove this wrapper once pi-mono ships file-magic MIME detection
 // for `read` image payloads in `@mariozechner/pi-coding-agent` (then switch back to `codingTools` directly).
@@ -12,15 +19,9 @@ type ToolContentBlock = AgentToolResult<unknown>["content"][number];
 type ImageContentBlock = Extract<ToolContentBlock, { type: "image" }>;
 type TextContentBlock = Extract<ToolContentBlock, { type: "text" }>;
 
-// Anthropic Messages API limitation (observed in Clawdis sessions):
-// When sending many images in a single request (e.g. via session history + tool results),
-// Anthropic rejects any image where *either* dimension exceeds 2000px.
-//
-// To keep sessions resilient (and avoid "silent" WhatsApp non-replies), we auto-downscale
-// all base64 image blocks above this limit while preserving aspect ratio.
-const MAX_IMAGE_DIMENSION_PX = 2000;
-
-function sniffMimeFromBase64(base64: string): string | undefined {
+async function sniffMimeFromBase64(
+  base64: string,
+): Promise<string | undefined> {
   const trimmed = base64.trim();
   if (!trimmed) return undefined;
 
@@ -30,7 +31,7 @@ function sniffMimeFromBase64(base64: string): string | undefined {
 
   try {
     const head = Buffer.from(trimmed.slice(0, sliceLen), "base64");
-    return detectMime({ buffer: head });
+    return await detectMime({ buffer: head });
   } catch {
     return undefined;
   }
@@ -44,10 +45,10 @@ function rewriteReadImageHeader(text: string, mimeType: string): string {
   return text;
 }
 
-function normalizeReadImageResult(
+async function normalizeReadImageResult(
   result: AgentToolResult<unknown>,
   filePath: string,
-): AgentToolResult<unknown> {
+): Promise<AgentToolResult<unknown>> {
   const content = Array.isArray(result.content) ? result.content : [];
 
   const image = content.find(
@@ -64,7 +65,7 @@ function normalizeReadImageResult(
     throw new Error(`read: image payload is empty (${filePath})`);
   }
 
-  const sniffed = sniffMimeFromBase64(image.data);
+  const sniffed = await sniffMimeFromBase64(image.data);
   if (!sniffed) return result;
 
   if (!sniffed.startsWith("image/")) {
@@ -103,6 +104,109 @@ function normalizeReadImageResult(
 }
 
 type AnyAgentTool = AgentTool<TSchema, unknown>;
+
+function extractEnumValues(schema: unknown): unknown[] | undefined {
+  if (!schema || typeof schema !== "object") return undefined;
+  const record = schema as Record<string, unknown>;
+  if (Array.isArray(record.enum)) return record.enum;
+  if ("const" in record) return [record.const];
+  return undefined;
+}
+
+function mergePropertySchemas(existing: unknown, incoming: unknown): unknown {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+
+  const existingEnum = extractEnumValues(existing);
+  const incomingEnum = extractEnumValues(incoming);
+  if (existingEnum || incomingEnum) {
+    const values = Array.from(
+      new Set([...(existingEnum ?? []), ...(incomingEnum ?? [])]),
+    );
+    const merged: Record<string, unknown> = {};
+    for (const source of [existing, incoming]) {
+      if (!source || typeof source !== "object") continue;
+      const record = source as Record<string, unknown>;
+      for (const key of ["title", "description", "default"]) {
+        if (!(key in merged) && key in record) merged[key] = record[key];
+      }
+    }
+    const types = new Set(values.map((value) => typeof value));
+    if (types.size === 1) merged.type = Array.from(types)[0];
+    merged.enum = values;
+    return merged;
+  }
+
+  return existing;
+}
+
+function normalizeToolParameters(tool: AnyAgentTool): AnyAgentTool {
+  const schema =
+    tool.parameters && typeof tool.parameters === "object"
+      ? (tool.parameters as Record<string, unknown>)
+      : undefined;
+  if (!schema) return tool;
+  if ("type" in schema && "properties" in schema) return tool;
+  if (!Array.isArray(schema.anyOf)) return tool;
+  const mergedProperties: Record<string, unknown> = {};
+  const requiredCounts = new Map<string, number>();
+  let objectVariants = 0;
+
+  for (const entry of schema.anyOf) {
+    if (!entry || typeof entry !== "object") continue;
+    const props = (entry as { properties?: unknown }).properties;
+    if (!props || typeof props !== "object") continue;
+    objectVariants += 1;
+    for (const [key, value] of Object.entries(
+      props as Record<string, unknown>,
+    )) {
+      if (!(key in mergedProperties)) {
+        mergedProperties[key] = value;
+        continue;
+      }
+      mergedProperties[key] = mergePropertySchemas(
+        mergedProperties[key],
+        value,
+      );
+    }
+    const required = Array.isArray((entry as { required?: unknown }).required)
+      ? (entry as { required: unknown[] }).required
+      : [];
+    for (const key of required) {
+      if (typeof key !== "string") continue;
+      requiredCounts.set(key, (requiredCounts.get(key) ?? 0) + 1);
+    }
+  }
+
+  const baseRequired = Array.isArray(schema.required)
+    ? schema.required.filter((key) => typeof key === "string")
+    : undefined;
+  const mergedRequired =
+    baseRequired && baseRequired.length > 0
+      ? baseRequired
+      : objectVariants > 0
+        ? Array.from(requiredCounts.entries())
+            .filter(([, count]) => count === objectVariants)
+            .map(([key]) => key)
+        : undefined;
+
+  return {
+    ...tool,
+    parameters: {
+      ...schema,
+      type: "object",
+      properties:
+        Object.keys(mergedProperties).length > 0
+          ? mergedProperties
+          : (schema.properties ?? {}),
+      ...(mergedRequired && mergedRequired.length > 0
+        ? { required: mergedRequired }
+        : {}),
+      additionalProperties:
+        "additionalProperties" in schema ? schema.additionalProperties : true,
+    } as unknown as TSchema,
+  };
+}
 
 function createWhatsAppLoginTool(): AnyAgentTool {
   return {
@@ -168,133 +272,6 @@ function createWhatsAppLoginTool(): AnyAgentTool {
   };
 }
 
-function isImageBlock(block: unknown): block is ImageContentBlock {
-  if (!block || typeof block !== "object") return false;
-  const rec = block as Record<string, unknown>;
-  return (
-    rec.type === "image" &&
-    typeof rec.data === "string" &&
-    typeof rec.mimeType === "string"
-  );
-}
-
-function isTextBlock(block: unknown): block is TextContentBlock {
-  if (!block || typeof block !== "object") return false;
-  const rec = block as Record<string, unknown>;
-  return rec.type === "text" && typeof rec.text === "string";
-}
-
-async function resizeImageBase64IfNeeded(params: {
-  base64: string;
-  mimeType: string;
-  maxDimensionPx: number;
-}): Promise<{ base64: string; mimeType: string; resized: boolean }> {
-  const buf = Buffer.from(params.base64, "base64");
-  const meta = await getImageMetadata(buf);
-  const width = meta?.width;
-  const height = meta?.height;
-  if (
-    typeof width !== "number" ||
-    typeof height !== "number" ||
-    (width <= params.maxDimensionPx && height <= params.maxDimensionPx)
-  ) {
-    return { base64: params.base64, mimeType: params.mimeType, resized: false };
-  }
-
-  const mime = params.mimeType.toLowerCase();
-  let out: Buffer;
-  try {
-    const mod = (await import("sharp")) as unknown as {
-      default?: typeof import("sharp");
-    };
-    const sharp = mod.default ?? (mod as unknown as typeof import("sharp"));
-    const img = sharp(buf, { failOnError: false }).resize({
-      width: params.maxDimensionPx,
-      height: params.maxDimensionPx,
-      fit: "inside",
-      withoutEnlargement: true,
-    });
-    if (mime === "image/jpeg" || mime === "image/jpg") {
-      out = await img.jpeg({ quality: 85 }).toBuffer();
-    } else if (mime === "image/webp") {
-      out = await img.webp({ quality: 85 }).toBuffer();
-    } else if (mime === "image/png") {
-      out = await img.png().toBuffer();
-    } else {
-      out = await img.png().toBuffer();
-    }
-  } catch {
-    // Bun can't load sharp native addons. Fall back to a JPEG conversion.
-    out = await resizeToJpeg({
-      buffer: buf,
-      maxSide: params.maxDimensionPx,
-      quality: 85,
-      withoutEnlargement: true,
-    });
-  }
-
-  const sniffed = detectMime({ buffer: out.slice(0, 256) });
-  const nextMime = sniffed?.startsWith("image/") ? sniffed : params.mimeType;
-
-  return { base64: out.toString("base64"), mimeType: nextMime, resized: true };
-}
-
-export async function sanitizeContentBlocksImages(
-  blocks: ToolContentBlock[],
-  label: string,
-  opts: { maxDimensionPx?: number } = {},
-): Promise<ToolContentBlock[]> {
-  const maxDimensionPx = Math.max(
-    opts.maxDimensionPx ?? MAX_IMAGE_DIMENSION_PX,
-    1,
-  );
-  const out: ToolContentBlock[] = [];
-
-  for (const block of blocks) {
-    if (!isImageBlock(block)) {
-      out.push(block);
-      continue;
-    }
-
-    const data = block.data.trim();
-    if (!data) {
-      out.push({
-        type: "text",
-        text: `[${label}] omitted empty image payload`,
-      } satisfies TextContentBlock);
-      continue;
-    }
-
-    try {
-      const resized = await resizeImageBase64IfNeeded({
-        base64: data,
-        mimeType: block.mimeType,
-        maxDimensionPx,
-      });
-      out.push({ ...block, data: resized.base64, mimeType: resized.mimeType });
-    } catch (err) {
-      out.push({
-        type: "text",
-        text: `[${label}] omitted image payload: ${String(err)}`,
-      } satisfies TextContentBlock);
-    }
-  }
-
-  return out;
-}
-
-export async function sanitizeToolResultImages(
-  result: AgentToolResult<unknown>,
-  label: string,
-  opts: { maxDimensionPx?: number } = {},
-): Promise<AgentToolResult<unknown>> {
-  const content = Array.isArray(result.content) ? result.content : [];
-  if (!content.some((b) => isImageBlock(b) || isTextBlock(b))) return result;
-
-  const next = await sanitizeContentBlocksImages(content, label, opts);
-  return { ...result, content: next };
-}
-
 function createClawdisReadTool(base: AnyAgentTool): AnyAgentTool {
   return {
     ...base,
@@ -310,33 +287,31 @@ function createClawdisReadTool(base: AnyAgentTool): AnyAgentTool {
           : undefined;
       const filePath =
         typeof record?.path === "string" ? String(record.path) : "<unknown>";
-      const normalized = normalizeReadImageResult(result, filePath);
+      const normalized = await normalizeReadImageResult(result, filePath);
       return sanitizeToolResultImages(normalized, `read:${filePath}`);
     },
   };
 }
 
-function createClawdisBashTool(base: AnyAgentTool): AnyAgentTool {
-  return {
+export function createClawdisCodingTools(options?: {
+  bash?: BashToolDefaults & ProcessToolDefaults;
+}): AnyAgentTool[] {
+  const bashToolName = "bash";
+  const base = (codingTools as unknown as AnyAgentTool[]).flatMap((tool) => {
+    if (tool.name === readTool.name) return [createClawdisReadTool(tool)];
+    if (tool.name === bashToolName) return [];
+    return [tool as AnyAgentTool];
+  });
+  const bashTool = createBashTool(options?.bash);
+  const processTool = createProcessTool({
+    cleanupMs: options?.bash?.cleanupMs,
+  });
+  const tools: AnyAgentTool[] = [
     ...base,
-    execute: async (toolCallId, params, signal) => {
-      const result = (await base.execute(
-        toolCallId,
-        params,
-        signal,
-      )) as AgentToolResult<unknown>;
-      return sanitizeToolResultImages(result, "bash");
-    },
-  };
-}
-
-export function createClawdisCodingTools(): AnyAgentTool[] {
-  const base = (codingTools as unknown as AnyAgentTool[]).map((tool) =>
-    tool.name === readTool.name
-      ? createClawdisReadTool(tool)
-      : tool.name === bashTool.name
-        ? createClawdisBashTool(tool)
-        : (tool as AnyAgentTool),
-  );
-  return [...base, createWhatsAppLoginTool()];
+    bashTool as unknown as AnyAgentTool,
+    processTool as unknown as AnyAgentTool,
+    createWhatsAppLoginTool(),
+    ...createClawdisTools(),
+  ];
+  return tools.map(normalizeToolParameters);
 }

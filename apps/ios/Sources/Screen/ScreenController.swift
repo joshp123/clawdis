@@ -19,12 +19,18 @@ final class ScreenController {
     /// Callback invoked when the user clicks an A2UI action (e.g. button) inside the canvas web UI.
     var onA2UIAction: (([String: Any]) -> Void)?
 
+    private var debugStatusEnabled: Bool = false
+    private var debugStatusTitle: String?
+    private var debugStatusSubtitle: String?
+
     init() {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
         let a2uiActionHandler = CanvasA2UIActionMessageHandler()
         let userContentController = WKUserContentController()
-        userContentController.add(a2uiActionHandler, name: CanvasA2UIActionMessageHandler.messageName)
+        for name in CanvasA2UIActionMessageHandler.handlerNames {
+            userContentController.add(a2uiActionHandler, name: name)
+        }
         config.userContentController = userContentController
         self.navigationDelegate = ScreenNavigationDelegate()
         self.a2uiActionHandler = a2uiActionHandler
@@ -78,6 +84,39 @@ final class ScreenController {
         self.reload()
     }
 
+    func setDebugStatusEnabled(_ enabled: Bool) {
+        self.debugStatusEnabled = enabled
+        self.applyDebugStatusIfNeeded()
+    }
+
+    func updateDebugStatus(title: String?, subtitle: String?) {
+        self.debugStatusTitle = title
+        self.debugStatusSubtitle = subtitle
+        self.applyDebugStatusIfNeeded()
+    }
+
+    fileprivate func applyDebugStatusIfNeeded() {
+        let enabled = self.debugStatusEnabled
+        let title = self.debugStatusTitle
+        let subtitle = self.debugStatusSubtitle
+        let js = """
+        (() => {
+          try {
+            const api = globalThis.__clawdis;
+            if (!api) return;
+            if (typeof api.setDebugStatusEnabled === 'function') {
+              api.setDebugStatusEnabled(\(enabled ? "true" : "false"));
+            }
+            if (!\(enabled ? "true" : "false")) return;
+            if (typeof api.setStatus === 'function') {
+              api.setStatus(\(Self.jsValue(title)), \(Self.jsValue(subtitle)));
+            }
+          } catch (_) {}
+        })()
+        """
+        self.webView.evaluateJavaScript(js) { _, _ in }
+    }
+
     func waitForA2UIReady(timeoutMs: Int) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .milliseconds(timeoutMs))
@@ -90,7 +129,8 @@ final class ScreenController {
                   } catch (_) { return false; }
                 })()
                 """)
-                if res == "true" { return true }
+                let trimmed = res.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if trimmed == "true" || trimmed == "1" { return true }
             } catch {
                 // ignore; page likely still loading
             }
@@ -210,6 +250,17 @@ final class ScreenController {
         return false
     }
 
+    private static func jsValue(_ value: String?) -> String {
+        guard let value else { return "null" }
+        if let data = try? JSONSerialization.data(withJSONObject: [value]),
+           let encoded = String(data: data, encoding: .utf8),
+           encoded.count >= 2
+        {
+            return String(encoded.dropFirst().dropLast())
+        }
+        return "null"
+    }
+
     func isLocalNetworkCanvasURL(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
             return false
@@ -316,6 +367,11 @@ private final class ScreenNavigationDelegate: NSObject, WKNavigationDelegate {
         self.controller?.errorText = error.localizedDescription
     }
 
+    func webView(_: WKWebView, didFinish _: WKNavigation?) {
+        self.controller?.errorText = nil
+        self.controller?.applyDebugStatusIfNeeded()
+    }
+
     func webView(_: WKWebView, didFail _: WKNavigation?, withError error: any Error) {
         self.controller?.errorText = error.localizedDescription
     }
@@ -323,6 +379,8 @@ private final class ScreenNavigationDelegate: NSObject, WKNavigationDelegate {
 
 private final class CanvasA2UIActionMessageHandler: NSObject, WKScriptMessageHandler {
     static let messageName = "clawdisCanvasA2UIAction"
+    static let legacyMessageNames = ["canvas", "a2ui", "userAction", "action"]
+    static let handlerNames = [messageName] + legacyMessageNames
 
     weak var controller: ScreenController?
 

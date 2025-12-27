@@ -1,15 +1,17 @@
 package com.steipete.clawdis.node.node
 
 import android.graphics.Bitmap
-import android.os.Build
 import android.graphics.Canvas
 import android.os.Looper
 import android.webkit.WebView
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.scale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import android.util.Base64
+import org.json.JSONObject
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -24,6 +26,9 @@ class CanvasController {
 
   @Volatile private var webView: WebView? = null
   @Volatile private var url: String? = null
+  @Volatile private var debugStatusEnabled: Boolean = false
+  @Volatile private var debugStatusTitle: String? = null
+  @Volatile private var debugStatusSubtitle: String? = null
 
   private val scaffoldAssetUrl = "file:///android_asset/CanvasScaffold/scaffold.html"
 
@@ -35,12 +40,32 @@ class CanvasController {
   fun attach(webView: WebView) {
     this.webView = webView
     reload()
+    applyDebugStatus()
   }
 
   fun navigate(url: String) {
     val trimmed = url.trim()
     this.url = if (trimmed.isBlank() || trimmed == "/") null else trimmed
     reload()
+  }
+
+  fun currentUrl(): String? = url
+
+  fun isDefaultCanvas(): Boolean = url == null
+
+  fun setDebugStatusEnabled(enabled: Boolean) {
+    debugStatusEnabled = enabled
+    applyDebugStatus()
+  }
+
+  fun setDebugStatus(title: String?, subtitle: String?) {
+    debugStatusTitle = title
+    debugStatusSubtitle = subtitle
+    applyDebugStatus()
+  }
+
+  fun onPageFinished() {
+    applyDebugStatus()
   }
 
   private inline fun withWebViewOnMain(crossinline block: (WebView) -> Unit) {
@@ -63,6 +88,32 @@ class CanvasController {
     }
   }
 
+  private fun applyDebugStatus() {
+    val enabled = debugStatusEnabled
+    val title = debugStatusTitle
+    val subtitle = debugStatusSubtitle
+    withWebViewOnMain { wv ->
+      val titleJs = title?.let { JSONObject.quote(it) } ?: "null"
+      val subtitleJs = subtitle?.let { JSONObject.quote(it) } ?: "null"
+      val js = """
+        (() => {
+          try {
+            const api = globalThis.__clawdis;
+            if (!api) return;
+            if (typeof api.setDebugStatusEnabled === 'function') {
+              api.setDebugStatusEnabled(${if (enabled) "true" else "false"});
+            }
+            if (!${if (enabled) "true" else "false"}) return;
+            if (typeof api.setStatus === 'function') {
+              api.setStatus($titleJs, $subtitleJs);
+            }
+          } catch (_) {}
+        })();
+      """.trimIndent()
+      wv.evaluateJavascript(js, null)
+    }
+  }
+
   suspend fun eval(javaScript: String): String =
     withContext(Dispatchers.Main) {
       val wv = webView ?: throw IllegalStateException("no webview")
@@ -80,7 +131,7 @@ class CanvasController {
       val scaled =
         if (maxWidth != null && maxWidth > 0 && bmp.width > maxWidth) {
           val h = (bmp.height.toDouble() * (maxWidth.toDouble() / bmp.width.toDouble())).toInt().coerceAtLeast(1)
-          Bitmap.createScaledBitmap(bmp, maxWidth, h, true)
+          bmp.scale(maxWidth, h)
         } else {
           bmp
         }
@@ -97,7 +148,7 @@ class CanvasController {
       val scaled =
         if (maxWidth != null && maxWidth > 0 && bmp.width > maxWidth) {
           val h = (bmp.height.toDouble() * (maxWidth.toDouble() / bmp.width.toDouble())).toInt().coerceAtLeast(1)
-          Bitmap.createScaledBitmap(bmp, maxWidth, h, true)
+          bmp.scale(maxWidth, h)
         } else {
           bmp
         }
@@ -116,7 +167,7 @@ class CanvasController {
     suspendCancellableCoroutine { cont ->
       val width = width.coerceAtLeast(1)
       val height = height.coerceAtLeast(1)
-      val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+      val bitmap = createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
       // WebView isn't supported by PixelCopy.request(...) directly; draw() is the most reliable
       // cross-version snapshot for this lightweight "canvas" use-case.

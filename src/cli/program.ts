@@ -16,6 +16,7 @@ import { registerCronCli } from "./cron-cli.js";
 import { createDefaultDeps } from "./deps.js";
 import { registerDnsCli } from "./dns-cli.js";
 import { registerGatewayCli } from "./gateway-cli.js";
+import { registerHooksCli } from "./hooks-cli.js";
 import { registerNodesCli } from "./nodes-cli.js";
 import { forceFreePort } from "./ports.js";
 
@@ -53,8 +54,12 @@ export function buildProgram() {
     outputError: (str, write) => write(chalk.red(str)),
   });
 
-  if (process.argv.includes("-V") || process.argv.includes("--version")) {
-    console.log(formatIntroLine(PROGRAM_VERSION));
+  if (
+    process.argv.includes("-V") ||
+    process.argv.includes("--version") ||
+    process.argv.includes("-v")
+  ) {
+    console.log(PROGRAM_VERSION);
     process.exit(0);
   }
 
@@ -98,7 +103,7 @@ export function buildProgram() {
     .description("Initialize ~/.clawdis/clawdis.json and the agent workspace")
     .option(
       "--workspace <dir>",
-      "Agent workspace directory (default: ~/clawd; stored as inbound.workspace)",
+      "Agent workspace directory (default: ~/clawd; stored as agent.workspace)",
     )
     .action(async (opts) => {
       try {
@@ -144,10 +149,10 @@ export function buildProgram() {
 
   program
     .command("send")
-    .description("Send a message (WhatsApp web or Telegram bot)")
+    .description("Send a message (WhatsApp Web, Telegram bot, or Discord)")
     .requiredOption(
       "-t, --to <number>",
-      "Recipient: E.164 for WhatsApp (e.g. +15555550123) or Telegram chat id/@username",
+      "Recipient: E.164 for WhatsApp, Telegram chat id/@username, or Discord channel/user",
     )
     .requiredOption("-m, --message <text>", "Message body")
     .option(
@@ -156,7 +161,7 @@ export function buildProgram() {
     )
     .option(
       "--provider <provider>",
-      "Delivery provider: whatsapp|telegram (default: whatsapp)",
+      "Delivery provider: whatsapp|telegram|discord (default: whatsapp)",
     )
     .option("--dry-run", "Print payload and skip sending", false)
     .option("--json", "Output result as JSON", false)
@@ -198,8 +203,12 @@ Examples:
     )
     .option("--verbose <on|off>", "Persist agent verbose level for the session")
     .option(
+      "--provider <provider>",
+      "Delivery provider: whatsapp|telegram|discord (default: whatsapp)",
+    )
+    .option(
       "--deliver",
-      "Send the agent's reply back to WhatsApp (requires --to)",
+      "Send the agent's reply back to the selected provider (requires --to)",
       false,
     )
     .option("--json", "Output result as JSON", false)
@@ -236,12 +245,17 @@ Examples:
   registerNodesCli(program);
   registerCronCli(program);
   registerDnsCli(program);
+  registerHooksCli(program);
 
   program
     .command("status")
     .description("Show web session health and recent session recipients")
     .option("--json", "Output JSON instead of text", false)
-    .option("--deep", "Probe providers (WA connect + Telegram API)", false)
+    .option(
+      "--deep",
+      "Probe providers (WhatsApp Web + Telegram + Discord)",
+      false,
+    )
     .option("--timeout <ms>", "Probe timeout in milliseconds", "10000")
     .option("--verbose", "Verbose logging", false)
     .addHelpText(
@@ -250,7 +264,7 @@ Examples:
 Examples:
   clawdis status                   # show linked account + session store summary
   clawdis status --json            # machine-readable output
-  clawdis status --deep            # run provider probes (WA + Telegram)
+  clawdis status --deep            # run provider probes (WA + Telegram + Discord)
   clawdis status --deep --timeout 5000 # tighten probe timeout`,
     )
     .action(async (opts) => {
@@ -334,7 +348,7 @@ Examples:
   clawdis sessions --json          # machine-readable output
   clawdis sessions --store ./tmp/sessions.json
 
-Shows token usage per session when the agent reports it; set inbound.agent.contextTokens to see % of your model window.`,
+Shows token usage per session when the agent reports it; set agent.contextTokens to see % of your model window.`,
     )
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));

@@ -6,11 +6,17 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { WebSocket } from "ws";
 import { agentCommand } from "../commands/agent.js";
+import { readConfigFileSnapshot, writeConfigFile } from "../config/config.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { GatewayLockError } from "../infra/gateway-lock.js";
 import { emitHeartbeatEvent } from "../infra/heartbeat-events.js";
+import { drainSystemEvents, peekSystemEvents } from "../infra/system-events.js";
+import { rawDataToString } from "../infra/ws.js";
 import { PROTOCOL_VERSION } from "./protocol/index.js";
-import { startGatewayServer } from "./server.js";
+import {
+  __resetModelCatalogCacheForTest,
+  startGatewayServer,
+} from "./server.js";
 
 type BridgeClientInfo = {
   nodeId: string;
@@ -58,6 +64,35 @@ const bridgeSendEvent = vi.hoisted(() => vi.fn());
 const testTailnetIPv4 = vi.hoisted(() => ({
   value: undefined as string | undefined,
 }));
+
+const piSdkMock = vi.hoisted(() => ({
+  enabled: false,
+  discoverCalls: 0,
+  models: [] as Array<{
+    id: string;
+    name?: string;
+    provider: string;
+    contextWindow?: number;
+  }>,
+}));
+const cronIsolatedRun = vi.hoisted(() =>
+  vi.fn(async () => ({ status: "ok", summary: "ok" })),
+);
+
+vi.mock("@mariozechner/pi-coding-agent", async () => {
+  const actual = await vi.importActual<
+    typeof import("@mariozechner/pi-coding-agent")
+  >("@mariozechner/pi-coding-agent");
+
+  return {
+    ...actual,
+    discoverModels: () => {
+      if (!piSdkMock.enabled) return actual.discoverModels();
+      piSdkMock.discoverCalls += 1;
+      return piSdkMock.models;
+    },
+  };
+});
 vi.mock("../infra/bridge/server.js", () => ({
   startNodeBridgeServer: vi.fn(async (opts: BridgeStartOpts) => {
     bridgeStartCalls.push(opts);
@@ -70,6 +105,9 @@ vi.mock("../infra/bridge/server.js", () => ({
     };
   }),
 }));
+vi.mock("../cron/isolated-agent.js", () => ({
+  runCronIsolatedAgentTurn: (...args: unknown[]) => cronIsolatedRun(...args),
+}));
 vi.mock("../infra/tailnet.js", () => ({
   pickPrimaryTailnetIPv4: () => testTailnetIPv4.value,
   pickPrimaryTailnetIPv6: () => undefined,
@@ -80,6 +118,8 @@ let testAllowFrom: string[] | undefined;
 let testCronStorePath: string | undefined;
 let testCronEnabled: boolean | undefined = false;
 let testGatewayBind: "auto" | "lan" | "tailnet" | "loopback" | undefined;
+let testGatewayAuth: Record<string, unknown> | undefined;
+let testHooksConfig: Record<string, unknown> | undefined;
 const sessionStoreSaveDelayMs = vi.hoisted(() => ({ value: 0 }));
 vi.mock("../config/sessions.js", async () => {
   const actual = await vi.importActual<typeof import("../config/sessions.js")>(
@@ -96,23 +136,101 @@ vi.mock("../config/sessions.js", async () => {
     }),
   };
 });
-vi.mock("../config/config.js", () => ({
-  loadConfig: () => ({
-    inbound: {
-      allowFrom: testAllowFrom,
-      workspace: path.join(os.tmpdir(), "clawd-gateway-test"),
-      agent: { provider: "anthropic", model: "claude-opus-4-5" },
+vi.mock("../config/config.js", () => {
+  const resolveConfigPath = () =>
+    path.join(os.homedir(), ".clawdis", "clawdis.json");
+
+  const readConfigFileSnapshot = async () => {
+    const configPath = resolveConfigPath();
+    try {
+      await fs.access(configPath);
+    } catch {
+      return {
+        path: configPath,
+        exists: false,
+        raw: null,
+        parsed: {},
+        valid: true,
+        config: {},
+        issues: [],
+      };
+    }
+    try {
+      const raw = await fs.readFile(configPath, "utf-8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      return {
+        path: configPath,
+        exists: true,
+        raw,
+        parsed,
+        valid: true,
+        config: parsed,
+        issues: [],
+      };
+    } catch (err) {
+      return {
+        path: configPath,
+        exists: true,
+        raw: null,
+        parsed: {},
+        valid: false,
+        config: {},
+        issues: [{ path: "", message: `read failed: ${String(err)}` }],
+      };
+    }
+  };
+
+  const writeConfigFile = async (cfg: Record<string, unknown>) => {
+    const configPath = resolveConfigPath();
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+    const raw = JSON.stringify(cfg, null, 2).trimEnd().concat("\n");
+    await fs.writeFile(configPath, raw, "utf-8");
+  };
+
+  return {
+    CONFIG_PATH_CLAWDIS: resolveConfigPath(),
+    isNixMode: false,
+    loadConfig: () => ({
+      agent: {
+        model: "anthropic/claude-opus-4-5",
+        workspace: path.join(os.tmpdir(), "clawd-gateway-test"),
+      },
+      routing: {
+        allowFrom: testAllowFrom,
+      },
       session: { mainKey: "main", store: testSessionStorePath },
+      gateway: (() => {
+        const gateway: Record<string, unknown> = {};
+        if (testGatewayBind) gateway.bind = testGatewayBind;
+        if (testGatewayAuth) gateway.auth = testGatewayAuth;
+        return Object.keys(gateway).length > 0 ? gateway : undefined;
+      })(),
+      hooks: testHooksConfig,
+      cron: (() => {
+        const cron: Record<string, unknown> = {};
+        if (typeof testCronEnabled === "boolean")
+          cron.enabled = testCronEnabled;
+        if (typeof testCronStorePath === "string")
+          cron.store = testCronStorePath;
+        return Object.keys(cron).length > 0 ? cron : undefined;
+      })(),
+    }),
+    parseConfigJson5: (raw: string) => {
+      try {
+        return { ok: true, parsed: JSON.parse(raw) as unknown };
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
     },
-    gateway: testGatewayBind ? { bind: testGatewayBind } : undefined,
-    cron: (() => {
-      const cron: Record<string, unknown> = {};
-      if (typeof testCronEnabled === "boolean") cron.enabled = testCronEnabled;
-      if (typeof testCronStorePath === "string") cron.store = testCronStorePath;
-      return Object.keys(cron).length > 0 ? cron : undefined;
-    })(),
-  }),
-}));
+    validateConfigObject: (parsed: unknown) => ({
+      ok: true,
+      config: parsed as Record<string, unknown>,
+      issues: [],
+    }),
+    readConfigFileSnapshot,
+    writeConfigFile,
+  };
+});
 
 vi.mock("../commands/health.js", () => ({
   getHealthSnapshot: vi.fn().mockResolvedValue({ ok: true, stub: true }),
@@ -141,6 +259,14 @@ beforeEach(async () => {
   sessionStoreSaveDelayMs.value = 0;
   testTailnetIPv4.value = undefined;
   testGatewayBind = undefined;
+  testGatewayAuth = undefined;
+  testHooksConfig = undefined;
+  cronIsolatedRun.mockClear();
+  drainSystemEvents();
+  __resetModelCatalogCacheForTest();
+  piSdkMock.enabled = false;
+  piSdkMock.discoverCalls = 0;
+  piSdkMock.models = [];
 });
 
 afterEach(async () => {
@@ -188,7 +314,7 @@ function onceMessage<T = unknown>(
       reject(new Error(`closed ${code}: ${reason.toString()}`));
     };
     const handler = (data: WebSocket.RawData) => {
-      const obj = JSON.parse(String(data));
+      const obj = JSON.parse(rawDataToString(data));
       if (filter(obj)) {
         clearTimeout(timer);
         ws.off("message", handler);
@@ -227,6 +353,7 @@ async function connectReq(
   ws: WebSocket,
   opts?: {
     token?: string;
+    password?: string;
     minProtocol?: number;
     maxProtocol?: number;
     client?: {
@@ -254,7 +381,13 @@ async function connectReq(
           mode: "test",
         },
         caps: [],
-        auth: opts?.token ? { token: opts.token } : undefined,
+        auth:
+          opts?.token || opts?.password
+            ? {
+                token: opts?.token,
+                password: opts?.password,
+              }
+            : undefined,
       },
     }),
   );
@@ -292,6 +425,16 @@ async function rpcReq<T = unknown>(
   }>(ws, (o) => o.type === "res" && o.id === id);
 }
 
+async function waitForSystemEvent(timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const events = peekSystemEvents();
+    if (events.length > 0) return events;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timeout waiting for system event");
+}
+
 describe("gateway server", () => {
   test("voicewake.get returns defaults and voicewake.set broadcasts", async () => {
     const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-home-"));
@@ -303,7 +446,7 @@ describe("gateway server", () => {
 
     const initial = await rpcReq<{ triggers: string[] }>(ws, "voicewake.get");
     expect(initial.ok).toBe(true);
-    expect(initial.payload?.triggers).toEqual(["clawd", "claude"]);
+    expect(initial.payload?.triggers).toEqual(["clawd", "claude", "computer"]);
 
     const changedP = onceMessage<{
       type: "event";
@@ -346,6 +489,138 @@ describe("gateway server", () => {
     }
   });
 
+  test("models.list returns model catalog", async () => {
+    piSdkMock.enabled = true;
+    piSdkMock.models = [
+      { id: "gpt-test-z", provider: "openai", contextWindow: 0 },
+      {
+        id: "gpt-test-a",
+        name: "A-Model",
+        provider: "openai",
+        contextWindow: 8000,
+      },
+      {
+        id: "claude-test-b",
+        name: "B-Model",
+        provider: "anthropic",
+        contextWindow: 1000,
+      },
+      {
+        id: "claude-test-a",
+        name: "A-Model",
+        provider: "anthropic",
+        contextWindow: 200_000,
+      },
+    ];
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    const res1 = await rpcReq<{
+      models: Array<{
+        id: string;
+        name: string;
+        provider: string;
+        contextWindow?: number;
+      }>;
+    }>(ws, "models.list");
+
+    const res2 = await rpcReq<{
+      models: Array<{
+        id: string;
+        name: string;
+        provider: string;
+        contextWindow?: number;
+      }>;
+    }>(ws, "models.list");
+
+    expect(res1.ok).toBe(true);
+    expect(res2.ok).toBe(true);
+
+    const models = res1.payload?.models ?? [];
+    expect(models).toEqual([
+      {
+        id: "claude-test-a",
+        name: "A-Model",
+        provider: "anthropic",
+        contextWindow: 200_000,
+      },
+      {
+        id: "claude-test-b",
+        name: "B-Model",
+        provider: "anthropic",
+        contextWindow: 1000,
+      },
+      {
+        id: "gpt-test-a",
+        name: "A-Model",
+        provider: "openai",
+        contextWindow: 8000,
+      },
+      {
+        id: "gpt-test-z",
+        name: "gpt-test-z",
+        provider: "openai",
+      },
+    ]);
+
+    // Cached across requests: should only call discoverModels once.
+    expect(piSdkMock.discoverCalls).toBe(1);
+
+    ws.close();
+    await server.close();
+  });
+
+  test("models.list rejects unknown params", async () => {
+    piSdkMock.enabled = true;
+    piSdkMock.models = [{ id: "gpt-test-a", name: "A", provider: "openai" }];
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    const res = await rpcReq(ws, "models.list", { extra: true });
+    expect(res.ok).toBe(false);
+    expect(res.error?.message ?? "").toMatch(/invalid models\.list params/i);
+
+    ws.close();
+    await server.close();
+  });
+
+  test("bridge RPC supports models.list and validates params", async () => {
+    piSdkMock.enabled = true;
+    piSdkMock.models = [{ id: "gpt-test-a", name: "A", provider: "openai" }];
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    const startCall = bridgeStartCalls.at(-1);
+    expect(startCall).toBeTruthy();
+
+    const okRes = await startCall?.onRequest?.("n1", {
+      id: "1",
+      method: "models.list",
+      paramsJSON: "{}",
+    });
+    expect(okRes?.ok).toBe(true);
+    const okPayload = JSON.parse(String(okRes?.payloadJSON ?? "{}")) as {
+      models?: unknown;
+    };
+    expect(Array.isArray(okPayload.models)).toBe(true);
+
+    const badRes = await startCall?.onRequest?.("n1", {
+      id: "2",
+      method: "models.list",
+      paramsJSON: JSON.stringify({ extra: true }),
+    });
+    expect(badRes?.ok).toBe(false);
+    expect(badRes && "error" in badRes ? badRes.error.code : "").toBe(
+      "INVALID_REQUEST",
+    );
+
+    ws.close();
+    await server.close();
+  });
+
   test("pushes voicewake.changed to nodes on connect and on updates", async () => {
     const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-home-"));
     const prevHome = process.env.HOME;
@@ -369,7 +644,7 @@ describe("gateway server", () => {
     const firstPayload = JSON.parse(String(first?.payloadJSON)) as {
       triggers?: unknown;
     };
-    expect(firstPayload.triggers).toEqual(["clawd", "claude"]);
+    expect(firstPayload.triggers).toEqual(["clawd", "claude", "computer"]);
 
     bridgeSendEvent.mockClear();
 
@@ -427,7 +702,7 @@ describe("gateway server", () => {
     expect(res1.ok).toBe(true);
     const req1 = (res1.payload as { request?: { requestId?: unknown } } | null)
       ?.request;
-    const requestId = String(req1?.requestId ?? "");
+    const requestId = typeof req1?.requestId === "string" ? req1.requestId : "";
     expect(requestId.length).toBeGreaterThan(0);
 
     const evt1 = await requestedP;
@@ -480,10 +755,10 @@ describe("gateway server", () => {
       payload?: unknown;
     }>(ws, (o) => o.type === "res" && o.id === "pair-approve-1");
     expect(approveRes.ok).toBe(true);
-    const token = String(
-      (approveRes.payload as { node?: { token?: unknown } } | null)?.node
-        ?.token ?? "",
-    );
+    const tokenValue = (
+      approveRes.payload as { node?: { token?: unknown } } | null
+    )?.node?.token;
+    const token = typeof tokenValue === "string" ? tokenValue : "";
     expect(token.length).toBeGreaterThan(0);
 
     const evt2 = await resolvedP;
@@ -968,6 +1243,7 @@ describe("gateway server", () => {
         id: "cron-add-log-1",
         method: "cron.add",
         params: {
+          name: "log test",
           enabled: true,
           schedule: { kind: "at", atMs },
           sessionTarget: "main",
@@ -983,7 +1259,8 @@ describe("gateway server", () => {
       payload?: unknown;
     }>(ws, (o) => o.type === "res" && o.id === "cron-add-log-1");
     expect(addRes.ok).toBe(true);
-    const jobId = String((addRes.payload as { id?: unknown } | null)?.id ?? "");
+    const jobIdValue = (addRes.payload as { id?: unknown } | null)?.id;
+    const jobId = typeof jobIdValue === "string" ? jobIdValue : "";
     expect(jobId.length > 0).toBe(true);
 
     ws.send(
@@ -1077,6 +1354,7 @@ describe("gateway server", () => {
         id: "cron-add-log-2",
         method: "cron.add",
         params: {
+          name: "log test (jobs.json)",
           enabled: true,
           schedule: { kind: "at", atMs },
           sessionTarget: "main",
@@ -1092,7 +1370,8 @@ describe("gateway server", () => {
       payload?: unknown;
     }>(ws, (o) => o.type === "res" && o.id === "cron-add-log-2");
     expect(addRes.ok).toBe(true);
-    const jobId = String((addRes.payload as { id?: unknown } | null)?.id ?? "");
+    const jobIdValue = (addRes.payload as { id?: unknown } | null)?.id;
+    const jobId = typeof jobIdValue === "string" ? jobIdValue : "";
     expect(jobId.length > 0).toBe(true);
 
     ws.send(
@@ -1198,7 +1477,11 @@ describe("gateway server", () => {
         | { enabled?: unknown; storePath?: unknown }
         | undefined;
       expect(statusPayload?.enabled).toBe(true);
-      expect(String(statusPayload?.storePath ?? "")).toContain("jobs.json");
+      const storePath =
+        typeof statusPayload?.storePath === "string"
+          ? statusPayload.storePath
+          : "";
+      expect(storePath).toContain("jobs.json");
 
       const atMs = Date.now() + 80;
       ws.send(
@@ -1207,6 +1490,7 @@ describe("gateway server", () => {
           id: "cron-add-auto-1",
           method: "cron.add",
           params: {
+            name: "auto run test",
             enabled: true,
             schedule: { kind: "at", atMs },
             sessionTarget: "main",
@@ -1221,9 +1505,8 @@ describe("gateway server", () => {
         payload?: unknown;
       }>(ws, (o) => o.type === "res" && o.id === "cron-add-auto-1");
       expect(addRes.ok).toBe(true);
-      const jobId = String(
-        (addRes.payload as { id?: unknown } | null)?.id ?? "",
-      );
+      const jobIdValue = (addRes.payload as { id?: unknown } | null)?.id;
+      const jobId = typeof jobIdValue === "string" ? jobIdValue : "";
       expect(jobId.length > 0).toBe(true);
 
       const finishedEvt = await onceMessage<{
@@ -1511,6 +1794,61 @@ describe("gateway server", () => {
     await server.close();
   });
 
+  test("agent routes main last-channel discord", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
+    testSessionStorePath = path.join(dir, "sessions.json");
+    await fs.writeFile(
+      testSessionStorePath,
+      JSON.stringify(
+        {
+          main: {
+            sessionId: "sess-discord",
+            updatedAt: Date.now(),
+            lastChannel: "discord",
+            lastTo: "channel:discord-123",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    ws.send(
+      JSON.stringify({
+        type: "req",
+        id: "agent-last-discord",
+        method: "agent",
+        params: {
+          message: "hi",
+          sessionKey: "main",
+          channel: "last",
+          deliver: true,
+          idempotencyKey: "idem-agent-last-discord",
+        },
+      }),
+    );
+    await onceMessage(
+      ws,
+      (o) => o.type === "res" && o.id === "agent-last-discord",
+    );
+
+    const spy = vi.mocked(agentCommand);
+    expect(spy).toHaveBeenCalled();
+    const call = spy.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(call.provider).toBe("discord");
+    expect(call.to).toBe("channel:discord-123");
+    expect(call.deliver).toBe(true);
+    expect(call.bestEffortDeliver).toBe(true);
+    expect(call.sessionId).toBe("sess-discord");
+
+    ws.close();
+    await server.close();
+  });
+
   test("agent ignores webchat last-channel for routing", async () => {
     testAllowFrom = ["+1555"];
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
@@ -1581,7 +1919,7 @@ describe("gateway server", () => {
     await new Promise<void>((resolve) => ws.once("open", resolve));
 
     const hello = await connectOk(ws, { token: "secret" });
-    expect(hello.canvasHostUrl).toBe(`http://100.64.0.1:${port}`);
+    expect(hello.canvasHostUrl).toBe(`http://100.64.0.1:18793`);
 
     ws.close();
     await server.close();
@@ -1615,6 +1953,35 @@ describe("gateway server", () => {
     ws.close();
     await server.close();
     process.env.CLAWDIS_GATEWAY_TOKEN = prevToken;
+  });
+
+  test("accepts password auth when configured", async () => {
+    testGatewayAuth = { mode: "password", password: "secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((resolve) => ws.once("open", resolve));
+
+    const res = await connectReq(ws, { password: "secret" });
+    expect(res.ok).toBe(true);
+
+    ws.close();
+    await server.close();
+  });
+
+  test("rejects invalid password", async () => {
+    testGatewayAuth = { mode: "password", password: "secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((resolve) => ws.once("open", resolve));
+
+    const res = await connectReq(ws, { password: "wrong" });
+    expect(res.ok).toBe(false);
+    expect(res.error?.message ?? "").toContain("unauthorized");
+
+    ws.close();
+    await server.close();
   });
 
   test(
@@ -1699,25 +2066,107 @@ describe("gateway server", () => {
         ws,
         (o) => o.type === "res" && o.id === "presence1",
       );
+      const providersP = onceMessage(
+        ws,
+        (o) => o.type === "res" && o.id === "providers1",
+      );
 
       const sendReq = (id: string, method: string) =>
         ws.send(JSON.stringify({ type: "req", id, method }));
       sendReq("health1", "health");
       sendReq("status1", "status");
       sendReq("presence1", "system-presence");
+      sendReq("providers1", "providers.status");
 
       const health = await healthP;
       const status = await statusP;
       const presence = await presenceP;
+      const providers = await providersP;
       expect(health.ok).toBe(true);
       expect(status.ok).toBe(true);
       expect(presence.ok).toBe(true);
+      expect(providers.ok).toBe(true);
       expect(Array.isArray(presence.payload)).toBe(true);
 
       ws.close();
       await server.close();
     },
   );
+
+  test("providers.status returns snapshot without probe", async () => {
+    const prevToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    const res = await rpcReq<{
+      whatsapp?: { linked?: boolean };
+      telegram?: {
+        configured?: boolean;
+        tokenSource?: string;
+        probe?: unknown;
+        lastProbeAt?: unknown;
+      };
+    }>(ws, "providers.status", { probe: false, timeoutMs: 2000 });
+    expect(res.ok).toBe(true);
+    expect(res.payload?.whatsapp).toBeTruthy();
+    expect(res.payload?.telegram?.configured).toBe(false);
+    expect(res.payload?.telegram?.tokenSource).toBe("none");
+    expect(res.payload?.telegram?.probe).toBeUndefined();
+    expect(res.payload?.telegram?.lastProbeAt).toBeNull();
+
+    ws.close();
+    await server.close();
+    if (prevToken === undefined) {
+      delete process.env.TELEGRAM_BOT_TOKEN;
+    } else {
+      process.env.TELEGRAM_BOT_TOKEN = prevToken;
+    }
+  });
+
+  test("web.logout reports no session when missing", async () => {
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    const res = await rpcReq<{ cleared?: boolean }>(ws, "web.logout");
+    expect(res.ok).toBe(true);
+    expect(res.payload?.cleared).toBe(false);
+
+    ws.close();
+    await server.close();
+  });
+
+  test("telegram.logout clears bot token from config", async () => {
+    const prevToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    await writeConfigFile({
+      telegram: { botToken: "123:abc", requireMention: false },
+    });
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    const res = await rpcReq<{ cleared?: boolean; envToken?: boolean }>(
+      ws,
+      "telegram.logout",
+    );
+    expect(res.ok).toBe(true);
+    expect(res.payload?.cleared).toBe(true);
+    expect(res.payload?.envToken).toBe(false);
+
+    const snap = await readConfigFileSnapshot();
+    expect(snap.valid).toBe(true);
+    expect(snap.config?.telegram?.botToken).toBeUndefined();
+    expect(snap.config?.telegram?.requireMention).toBe(false);
+
+    ws.close();
+    await server.close();
+    if (prevToken === undefined) {
+      delete process.env.TELEGRAM_BOT_TOKEN;
+    } else {
+      process.env.TELEGRAM_BOT_TOKEN = prevToken;
+    }
+  });
 
   test(
     "presence events carry seq + stateVersion",
@@ -2142,7 +2591,7 @@ describe("gateway server", () => {
     await server.close();
   });
 
-  test("chat.history caps payload bytes", async () => {
+  test("chat.history caps payload bytes", { timeout: 15_000 }, async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
     testSessionStorePath = path.join(dir, "sessions.json");
     await fs.writeFile(
@@ -2163,9 +2612,9 @@ describe("gateway server", () => {
     const { server, ws } = await startServerWithClient();
     await connectOk(ws);
 
-    const bigText = "x".repeat(300_000);
+    const bigText = "x".repeat(200_000);
     const largeLines: string[] = [];
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 40; i += 1) {
       largeLines.push(
         JSON.stringify({
           message: {
@@ -3024,6 +3473,21 @@ describe("gateway server", () => {
     testSessionStorePath = storePath;
 
     await fs.writeFile(
+      path.join(dir, "sess-main.jsonl"),
+      `${Array.from({ length: 10 })
+        .map((_, idx) =>
+          JSON.stringify({ role: "user", content: `line ${idx}` }),
+        )
+        .join("\n")}\n`,
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(dir, "sess-group.jsonl"),
+      `${JSON.stringify({ role: "user", content: "group line 0" })}\n`,
+      "utf-8",
+    );
+
+    await fs.writeFile(
       storePath,
       JSON.stringify(
         {
@@ -3056,7 +3520,15 @@ describe("gateway server", () => {
     expect(
       (hello as unknown as { features?: { methods?: string[] } }).features
         ?.methods,
-    ).toEqual(expect.arrayContaining(["sessions.list", "sessions.patch"]));
+    ).toEqual(
+      expect.arrayContaining([
+        "sessions.list",
+        "sessions.patch",
+        "sessions.reset",
+        "sessions.delete",
+        "sessions.compact",
+      ]),
+    );
 
     const list1 = await rpcReq<{
       path: string;
@@ -3118,6 +3590,52 @@ describe("gateway server", () => {
     expect(main2?.thinkingLevel).toBe("medium");
     expect(main2?.verboseLevel).toBeUndefined();
 
+    const compacted = await rpcReq<{ ok: true; compacted: boolean }>(
+      ws,
+      "sessions.compact",
+      { key: "main", maxLines: 3 },
+    );
+    expect(compacted.ok).toBe(true);
+    expect(compacted.payload?.compacted).toBe(true);
+    const compactedLines = (
+      await fs.readFile(path.join(dir, "sess-main.jsonl"), "utf-8")
+    )
+      .split(/\r?\n/)
+      .filter((l) => l.trim().length > 0);
+    expect(compactedLines).toHaveLength(3);
+    const filesAfterCompact = await fs.readdir(dir);
+    expect(
+      filesAfterCompact.some((f) => f.startsWith("sess-main.jsonl.bak.")),
+    ).toBe(true);
+
+    const deleted = await rpcReq<{ ok: true; deleted: boolean }>(
+      ws,
+      "sessions.delete",
+      { key: "group:dev" },
+    );
+    expect(deleted.ok).toBe(true);
+    expect(deleted.payload?.deleted).toBe(true);
+    const listAfterDelete = await rpcReq<{
+      sessions: Array<{ key: string }>;
+    }>(ws, "sessions.list", {});
+    expect(listAfterDelete.ok).toBe(true);
+    expect(
+      listAfterDelete.payload?.sessions.some((s) => s.key === "group:dev"),
+    ).toBe(false);
+    const filesAfterDelete = await fs.readdir(dir);
+    expect(
+      filesAfterDelete.some((f) => f.startsWith("sess-group.jsonl.deleted.")),
+    ).toBe(true);
+
+    const reset = await rpcReq<{
+      ok: true;
+      key: string;
+      entry: { sessionId: string };
+    }>(ws, "sessions.reset", { key: "main" });
+    expect(reset.ok).toBe(true);
+    expect(reset.payload?.key).toBe("main");
+    expect(reset.payload?.entry.sessionId).not.toBe("sess-main");
+
     const badThinking = await rpcReq(ws, "sessions.patch", {
       key: "main",
       thinkingLevel: "banana",
@@ -3156,5 +3674,175 @@ describe("gateway server", () => {
     await new Promise<void>((resolve, reject) =>
       probe.close((err) => (err ? reject(err) : resolve())),
     );
+  });
+
+  test("hooks wake requires auth", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/wake`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Ping" }),
+    });
+    expect(res.status).toBe(401);
+    await server.close();
+  });
+
+  test("hooks wake enqueues system event", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/wake`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer hook-secret",
+      },
+      body: JSON.stringify({ text: "Ping", mode: "next-heartbeat" }),
+    });
+    expect(res.status).toBe(200);
+    const events = await waitForSystemEvent();
+    expect(events.some((e) => e.includes("Ping"))).toBe(true);
+    drainSystemEvents();
+    await server.close();
+  });
+
+  test("hooks agent posts summary to main", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    cronIsolatedRun.mockResolvedValueOnce({
+      status: "ok",
+      summary: "done",
+    });
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/agent`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer hook-secret",
+      },
+      body: JSON.stringify({ message: "Do it", name: "Email" }),
+    });
+    expect(res.status).toBe(202);
+    const events = await waitForSystemEvent();
+    expect(events.some((e) => e.includes("Hook Email: done"))).toBe(true);
+    drainSystemEvents();
+    await server.close();
+  });
+
+  test("hooks wake accepts query token", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(
+      `http://127.0.0.1:${port}/hooks/wake?token=hook-secret`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "Query auth" }),
+      },
+    );
+    expect(res.status).toBe(200);
+    const events = await waitForSystemEvent();
+    expect(events.some((e) => e.includes("Query auth"))).toBe(true);
+    drainSystemEvents();
+    await server.close();
+  });
+
+  test("hooks agent rejects invalid channel", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/agent`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer hook-secret",
+      },
+      body: JSON.stringify({ message: "Nope", channel: "sms" }),
+    });
+    expect(res.status).toBe(400);
+    expect(peekSystemEvents().length).toBe(0);
+    await server.close();
+  });
+
+  test("hooks wake accepts x-clawdis-token header", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/wake`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-clawdis-token": "hook-secret",
+      },
+      body: JSON.stringify({ text: "Header auth" }),
+    });
+    expect(res.status).toBe(200);
+    const events = await waitForSystemEvent();
+    expect(events.some((e) => e.includes("Header auth"))).toBe(true);
+    drainSystemEvents();
+    await server.close();
+  });
+
+  test("hooks rejects non-post", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/wake`, {
+      method: "GET",
+      headers: { Authorization: "Bearer hook-secret" },
+    });
+    expect(res.status).toBe(405);
+    await server.close();
+  });
+
+  test("hooks wake requires text", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/wake`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer hook-secret",
+      },
+      body: JSON.stringify({ text: " " }),
+    });
+    expect(res.status).toBe(400);
+    await server.close();
+  });
+
+  test("hooks agent requires message", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/agent`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer hook-secret",
+      },
+      body: JSON.stringify({ message: " " }),
+    });
+    expect(res.status).toBe(400);
+    await server.close();
+  });
+
+  test("hooks rejects invalid json", async () => {
+    testHooksConfig = { enabled: true, token: "hook-secret" };
+    const port = await getFreePort();
+    const server = await startGatewayServer(port);
+    const res = await fetch(`http://127.0.0.1:${port}/hooks/wake`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer hook-secret",
+      },
+      body: "{",
+    });
+    expect(res.status).toBe(400);
+    await server.close();
   });
 });

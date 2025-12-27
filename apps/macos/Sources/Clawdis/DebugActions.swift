@@ -108,6 +108,27 @@ enum DebugActions {
         }
     }
 
+    static func resetGatewayTunnel() async -> Result<String, DebugActionError> {
+        let mode = CommandResolver.connectionSettings().mode
+        guard mode == .remote else {
+            return .failure(.message("Remote mode is not enabled."))
+        }
+        await RemoteTunnelManager.shared.stopAll()
+        await GatewayConnection.shared.shutdown()
+        do {
+            _ = try await RemoteTunnelManager.shared.ensureControlTunnel()
+            let settings = CommandResolver.connectionSettings()
+            try await ControlChannel.shared.configure(mode: .remote(
+                target: settings.target,
+                identity: settings.identity))
+            await HealthStore.shared.refresh(onDemand: true)
+            return .success("SSH tunnel reset.")
+        } catch {
+            Task { await HealthStore.shared.refresh(onDemand: true) }
+            return .failure(.message(error.localizedDescription))
+        }
+    }
+
     static func pinoLogPath() -> String {
         LogLocator.bestLogFile()?.path ?? LogLocator.launchdLogPath
     }
@@ -163,9 +184,7 @@ enum DebugActions {
         guard
             let data = try? Data(contentsOf: configURL),
             let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let inbound = parsed["inbound"] as? [String: Any],
-            let reply = inbound["reply"] as? [String: Any],
-            let session = reply["session"] as? [String: Any],
+            let session = parsed["session"] as? [String: Any],
             let path = session["store"] as? String,
             !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {

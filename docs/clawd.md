@@ -7,19 +7,19 @@ read_when:
 <!-- {% raw %} -->
 # Building a personal assistant with CLAWDIS (Clawd-style)
 
-CLAWDIS is a WhatsApp + Telegram gateway for **Pi** agents. This guide is the “personal assistant” setup: one dedicated WhatsApp number that behaves like your always-on agent.
+CLAWDIS is a WhatsApp + Telegram + Discord gateway for **Pi** agents. This guide is the “personal assistant” setup: one dedicated WhatsApp number that behaves like your always-on agent.
 
 ## ⚠️ Safety first
 
 You’re putting an agent in a position to:
 - run commands on your machine (depending on your Pi tool setup)
 - read/write files in your workspace
-- send messages back out via WhatsApp/Telegram
+- send messages back out via WhatsApp/Telegram/Discord
 
 Start conservative:
-- Always set `inbound.allowFrom` (never run open-to-the-world on your personal Mac).
+- Always set `routing.allowFrom` (never run open-to-the-world on your personal Mac).
 - Use a dedicated WhatsApp number for the assistant.
-- Keep heartbeats disabled until you trust the setup (`heartbeatMinutes: 0`).
+- Keep heartbeats disabled until you trust the setup (omit `agent.heartbeat` or set `agent.heartbeat.every: "0m"`).
 
 ## Prerequisites
 
@@ -74,7 +74,7 @@ clawdis gateway --port 18789
 
 ```json5
 {
-  inbound: {
+  routing: {
     allowFrom: ["+15555550123"]
   }
 }
@@ -94,11 +94,11 @@ Tip: treat this folder like Clawd’s “memory” and make it a git repo (ideal
 clawdis setup
 ```
 
-Optional: choose a different workspace with `inbound.workspace` (supports `~`).
+Optional: choose a different workspace with `agent.workspace` (supports `~`).
 
 ```json5
 {
-  inbound: {
+  agent: {
     workspace: "~/clawd"
   }
 }
@@ -116,27 +116,26 @@ Example:
 ```json5
 {
   logging: { level: "info" },
-  inbound: {
-    allowFrom: ["+15555550123"],
+  agent: {
+    model: "anthropic/claude-opus-4-5",
     workspace: "~/clawd",
+    thinkingDefault: "high",
+    timeoutSeconds: 1800,
+    // Start with 0; enable later.
+    heartbeat: { every: "0m" }
+  },
+  routing: {
+    allowFrom: ["+15555550123"],
     groupChat: {
       requireMention: true,
       mentionPatterns: ["@clawd", "clawd"]
-    },
-    agent: {
-      provider: "anthropic",
-      model: "claude-opus-4-5",
-      thinkingDefault: "high",
-      timeoutSeconds: 1800,
-      // Start with 0; enable later.
-      heartbeatMinutes: 0
-    },
-    session: {
-      scope: "per-sender",
-      resetTriggers: ["/new"],
-      idleMinutes: 10080,
-      mainKey: "main"
     }
+  },
+  session: {
+    scope: "per-sender",
+    resetTriggers: ["/new", "/reset"],
+    idleMinutes: 10080,
+    mainKey: "main"
   }
 }
 ```
@@ -145,20 +144,18 @@ Example:
 
 - Session files: `~/.clawdis/sessions/{{SessionId}}.jsonl`
 - Session metadata (token usage, last route, etc): `~/.clawdis/sessions/sessions.json` (legacy: `~/.clawdis/sessions.json`)
-- `/new` starts a fresh session for that chat (configurable via `resetTriggers`). If sent alone, the agent replies with a short hello to confirm the reset.
+- `/new` or `/reset` starts a fresh session for that chat (configurable via `resetTriggers`). If sent alone, the agent replies with a short hello to confirm the reset.
 
 ## Heartbeats (proactive mode)
 
-When `inbound.agent.heartbeatMinutes > 0`, CLAWDIS periodically runs a heartbeat prompt (default: `HEARTBEAT`).
+When `agent.heartbeat.every` is set to a positive interval, CLAWDIS periodically runs a heartbeat prompt (default: `HEARTBEAT`).
 
 - If the agent replies with `HEARTBEAT_OK` (exact token), CLAWDIS suppresses outbound delivery for that heartbeat.
 
 ```json5
 {
-  inbound: {
-    agent: {
-      heartbeatMinutes: 30
-    }
+  agent: {
+    heartbeat: { every: "30m" }
   }
 }
 ```

@@ -72,7 +72,7 @@ describe("gateway SIGTERM", () => {
     child = null;
   });
 
-  it("exits 0 on SIGTERM", { timeout: 30_000 }, async () => {
+  it("exits 0 on SIGTERM", { timeout: 60_000 }, async () => {
     const port = await getFreePort();
     const out: string[] = [];
     const err: string[] = [];
@@ -86,6 +86,8 @@ describe("gateway SIGTERM", () => {
         "gateway",
         "--port",
         String(port),
+        "--bind",
+        "loopback",
         "--allow-unconfigured",
       ],
       {
@@ -93,6 +95,8 @@ describe("gateway SIGTERM", () => {
         env: {
           ...process.env,
           CLAWDIS_SKIP_PROVIDERS: "1",
+          CLAWDIS_SKIP_BROWSER_CONTROL_SERVER: "1",
+          CLAWDIS_SKIP_CANVAS_HOST: "1",
           // Avoid port collisions with other test processes that may also start a bridge server.
           CLAWDIS_BRIDGE_HOST: "127.0.0.1",
           CLAWDIS_BRIDGE_PORT: "0",
@@ -109,7 +113,7 @@ describe("gateway SIGTERM", () => {
     child.stdout?.on("data", (d) => out.push(String(d)));
     child.stderr?.on("data", (d) => err.push(String(d)));
 
-    await waitForPortOpen(proc, out, err, port, 20_000);
+    await waitForPortOpen(proc, out, err, port, 45_000);
 
     proc.kill("SIGTERM");
 

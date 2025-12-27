@@ -1,13 +1,15 @@
 import Foundation
 
 enum GatewayLaunchAgentManager {
+    private static let supportedBindModes: Set<String> = ["loopback", "tailnet", "lan", "auto"]
+
     private static var plistURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/\(gatewayLaunchdLabel).plist")
     }
 
     private static func gatewayExecutablePath(bundlePath: String) -> String {
-        "\(bundlePath)/Contents/Resources/Relay/clawdis-gateway"
+        "\(bundlePath)/Contents/Resources/Relay/clawdis"
     }
 
     private static func relayDir(bundlePath: String) -> String {
@@ -34,7 +36,9 @@ enum GatewayLaunchAgentManager {
                     ? "Failed to bootstrap gateway launchd job"
                     : bootstrap.output.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            _ = await self.runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(gatewayLaunchdLabel)"])
+            // Note: removed redundant `kickstart -k` that caused race condition.
+            // bootstrap already starts the job; kickstart -k would kill it immediately
+            // and with KeepAlive=true, cause a restart loop with port conflicts.
             return nil
         }
 
@@ -50,9 +54,22 @@ enum GatewayLaunchAgentManager {
     private static func writePlist(bundlePath: String, port: Int) {
         let gatewayBin = self.gatewayExecutablePath(bundlePath: bundlePath)
         let relayDir = self.relayDir(bundlePath: bundlePath)
-        let preferredPath =
-            ([relayDir] + CommandResolver.preferredPaths())
-                .joined(separator: ":")
+        let preferredPath = ([relayDir] + CommandResolver.preferredPaths())
+            .joined(separator: ":")
+        let bind = self.preferredGatewayBind() ?? "loopback"
+        let token = self.preferredGatewayToken()
+        var envEntries = """
+            <key>PATH</key>
+            <string>\(preferredPath)</string>
+            <key>CLAWDIS_IMAGE_BACKEND</key>
+            <string>sips</string>
+        """
+        if let token {
+            envEntries += """
+                <key>CLAWDIS_GATEWAY_TOKEN</key>
+                <string>\(token)</string>
+            """
+        }
         let plist = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -63,10 +80,11 @@ enum GatewayLaunchAgentManager {
           <key>ProgramArguments</key>
           <array>
             <string>\(gatewayBin)</string>
+            <string>gateway-daemon</string>
             <string>--port</string>
             <string>\(port)</string>
             <string>--bind</string>
-            <string>loopback</string>
+            <string>\(bind)</string>
           </array>
           <key>WorkingDirectory</key>
           <string>\(FileManager.default.homeDirectoryForCurrentUser.path)</string>
@@ -76,12 +94,7 @@ enum GatewayLaunchAgentManager {
           <true/>
           <key>EnvironmentVariables</key>
           <dict>
-            <key>PATH</key>
-            <string>\(preferredPath)</string>
-            <key>CLAWDIS_SKIP_BROWSER_CONTROL_SERVER</key>
-            <string>1</string>
-            <key>CLAWDIS_IMAGE_BACKEND</key>
-            <string>sips</string>
+        \(envEntries)
           </dict>
           <key>StandardOutPath</key>
           <string>\(LogLocator.launchdGatewayLogPath)</string>
@@ -91,6 +104,33 @@ enum GatewayLaunchAgentManager {
         </plist>
         """
         try? plist.write(to: self.plistURL, atomically: true, encoding: .utf8)
+    }
+
+    private static func preferredGatewayBind() -> String? {
+        if let env = ProcessInfo.processInfo.environment["CLAWDIS_GATEWAY_BIND"] {
+            let trimmed = env.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if self.supportedBindModes.contains(trimmed) {
+                return trimmed
+            }
+        }
+
+        let root = ClawdisConfigFile.loadDict()
+        if let gateway = root["gateway"] as? [String: Any],
+           let bind = gateway["bind"] as? String
+        {
+            let trimmed = bind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if self.supportedBindModes.contains(trimmed) {
+                return trimmed
+            }
+        }
+
+        return nil
+    }
+
+    private static func preferredGatewayToken() -> String? {
+        let raw = ProcessInfo.processInfo.environment["CLAWDIS_GATEWAY_TOKEN"] ?? ""
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private struct LaunchctlResult {
@@ -119,3 +159,23 @@ enum GatewayLaunchAgentManager {
         }.value
     }
 }
+
+#if DEBUG
+extension GatewayLaunchAgentManager {
+    static func _testGatewayExecutablePath(bundlePath: String) -> String {
+        self.gatewayExecutablePath(bundlePath: bundlePath)
+    }
+
+    static func _testRelayDir(bundlePath: String) -> String {
+        self.relayDir(bundlePath: bundlePath)
+    }
+
+    static func _testPreferredGatewayBind() -> String? {
+        self.preferredGatewayBind()
+    }
+
+    static func _testPreferredGatewayToken() -> String? {
+        self.preferredGatewayToken()
+    }
+}
+#endif

@@ -1,5 +1,150 @@
 # Changelog
 
+## 2.0.0-beta4 — 2025-12-27
+
+### Fixes
+- Package contents: include Discord/hooks build outputs in the npm tarball to avoid missing module errors.
+- Heartbeat replies now drop any output containing `HEARTBEAT_OK`, preventing stray emoji/text from being delivered.
+- macOS menu now refreshes the control channel after the gateway starts and shows “Connecting to gateway…” while the gateway is coming up.
+
+## 2.0.0-beta3 — 2025-12-27
+
+### Highlights
+- First-class Clawdis tools (browser, canvas, nodes, cron) replace the old `clawdis-*` skills; tool schemas are now injected directly into the agent runtime.
+- Per-session model selection + custom model providers: `models.providers` merges into `~/.clawdis/agent/models.json` (merge/replace modes) for LiteLLM, local OpenAI-compatible servers, Anthropic proxies, etc.
+- Group chat activation modes: per-group `/activation mention|always` command with status visibility.
+- Discord bot transport for DMs and guild text channels, with allowlists + mention gating.
+- Gateway webhooks: external `wake` and isolated `agent` hooks with dedicated token auth.
+- Hook mappings + Gmail Pub/Sub helper (`clawdis hooks gmail setup/run`) with auto-renew + Tailscale Funnel support.
+- Command queue modes + per-session overrides (`/queue ...`) and new `agent.maxConcurrent` cap for safe parallelism across sessions.
+- Background bash tasks: `bash` auto-yields after 20s (or on demand) with a `process` tool to list/poll/log/write/kill sessions.
+- Gateway in-process restart: `clawdis_gateway` tool action triggers a SIGUSR1 restart without needing a supervisor.
+
+### Breaking
+- Config refactor: `inbound.*` removed; use top-level `routing` (allowlists + group rules + transcription), `messages` (prefixes/timestamps), and `session` (scoping/store/mainKey). No legacy keys read.
+- Heartbeat config moved to `agent.heartbeat`: set `every: "30m"` (duration string) and optional `model`. `agent.heartbeatMinutes` is removed, and heartbeats are disabled unless `agent.heartbeat.every` is set.
+- Heartbeats now run via the gateway runner (main session) and deliver to the last used channel by default. WhatsApp reply-heartbeat behavior is removed; use `agent.heartbeat.target`/`to` (or `target: "none"`) to control delivery.
+- Browser `act` no longer accepts CSS `selector`; use `snapshot` refs (default `ai`) or `evaluate` as an escape hatch.
+
+### Fixes
+- Heartbeat replies now strip repeated `HEARTBEAT_OK` tails to avoid accidental “OK OK” spam.
+- Heartbeat delivery now uses the last non-empty payload, preventing tool preambles from swallowing the final reply.
+- Heartbeats now skip WhatsApp delivery when the web provider is inactive or unlinked (instead of logging “no active gateway listener”).
+- Heartbeat failure logs now include the error reason instead of `[object Object]`.
+- Duration strings now accept `h` (hours) where durations are parsed (e.g., heartbeat intervals).
+- WhatsApp inbound now normalizes more wrapper types so quoted reply bodies are extracted reliably.
+- WhatsApp send now preserves existing JIDs (including group `@g.us`) instead of coercing to `@s.whatsapp.net`. (Thanks @arun-8687.)
+- Telegram/WhatsApp: reply context stays in `Body`/`ReplyTo*`, but outbound replies no longer thread to the original message. (Thanks @joshp123 for the PR and follow-up question.)
+- Suppressed libsignal session cleanup spam from console logs unless verbose mode is enabled.
+- WhatsApp web creds persistence hardened; credentials are restored before auth checks and QR login auto-restarts if it stalls.
+- Group chats now honor `routing.groupChat.requireMention=false` as the default activation when no per-group override exists.
+- Gateway auth no longer supports PAM/system mode; use token or shared password.
+- Tailscale Funnel now requires password auth (no token-only public exposure).
+- Group `/new` resets now work with @mentions so activation guidance appears on fresh sessions.
+- Group chat activation context is now injected into the system prompt at session start (and after activation changes), including /new greetings.
+- Typing indicators now start only once a reply payload is produced (no "thinking" typing for silent runs).
+- WhatsApp group typing now starts immediately only when the bot is mentioned; otherwise it waits until real output exists.
+- Streamed `<think>` segments are stripped before partial replies are emitted.
+- System prompt now tags allowlisted owner numbers as the user identity to avoid mistaken “friend” assumptions.
+- LM Studio/Ollama replies now require <final> tags; streaming ignores content until <final> begins.
+- LM Studio responses API: tools payloads no longer include `strict: null`, and LM Studio no longer gets forced `<think>/<final>` tags.
+- Identity emoji no longer auto-prefixes replies (set `messages.responsePrefix` explicitly if desired).
+- Model switches now enqueue a system event so the next run knows the active model.
+- `/model status` now lists available models (same as `/model`).
+- `process log` pagination is now line-based (omit `offset` to grab the last N lines).
+- macOS WebChat: assistant bubbles now update correctly when toggling light/dark mode.
+- macOS: avoid spawning a duplicate gateway process when an external listener already exists.
+- Node bridge: when binding to a non-loopback host (e.g. Tailnet IP), also listens on `127.0.0.1` for local connections (without creating duplicate loopback listeners for `0.0.0.0`/`127.0.0.1` binds).
+- UI perf: pause repeat animations when scenes are inactive (typing dots, onboarding glow, iOS status pulse), throttle voice overlay level updates, and reduce overlay focus churn.
+- Canvas defaults/A2UI auto-nav aligned; debug status overlay centered; redundant await removed in `CanvasManager`.
+- Gateway launchd loop fixed by removing redundant `kickstart -k`.
+- CLI now hints when Peekaboo is unauthorized.
+- WhatsApp web inbox listeners now clean up on close to avoid duplicate handlers.
+- Gateway startup now brings up browser control before external providers; WhatsApp/Telegram/Discord auto-start can be disabled with `web.enabled`, `telegram.enabled`, or `discord.enabled`.
+
+### Providers & Routing
+- New Discord provider for DMs + guild text channels with allowlists and mention-gated replies by default.
+- `routing.queue` now controls queue vs interrupt behavior globally + per surface (defaults: WhatsApp/Telegram interrupt, Discord/WebChat queue).
+- `/queue <mode>` supports one-shot or per-session overrides; `/queue reset|default` clears overrides.
+- `agent.maxConcurrent` caps global parallel runs while keeping per-session serialization.
+
+### macOS app
+- Update-ready state surfaced in the menu; menu sections regrouped with session submenus.
+- Menu bar now shows a dedicated Nodes section under Context with inline rows, overflow submenu, and iconized actions.
+- Nodes now expose consistent inline details with per-node submenus for quick copy of key fields.
+- Node rows now show compact app versions (build numbers moved to submenus) and offer SSH launch from Bonjour when available.
+- Menu actions are grouped below toggles; Open Canvas hides when disabled and Voice Wake now anchors the mic picker.
+- Connections now include Discord provider status + configuration UI.
+- Menu bar gains an Allow Camera toggle alongside Canvas.
+- Session list polish: sleeping/disconnected/error states, usage bar restored, padding + bar sizing tuned, syncing menu removed, header hidden when disconnected.
+- Chat UI polish: tool call cards + merged tool results, glass background, tighter composer spacing, visual effect host tweaks.
+- OAuth storage moved; legacy session syncing metadata removed.
+- Remote SSH tunnels now get health checks; Debug → Ports highlights unhealthy tunnels and offers Reset SSH tunnel.
+- Menu bar session/node sections no longer reflow while open, keeping hover highlights aligned.
+- Menu hover highlights now span the full width (including submenu arrows).
+- Menu session rows now refresh while open without width changes (no more stuck “Loading sessions…”).
+- Menu width no longer grows on hover when moving the mouse across rows.
+- Context usage bars now have higher contrast in light mode.
+- macOS node timeouts now share a single async timeout helper for consistent behavior.
+- WebChat window defaults tightened (narrower width, edge-to-edge layout) and the SwiftUI tag removed from the title.
+
+### Nodes & Canvas
+- Debug status overlay gated and toggleable on macOS/iOS/Android nodes.
+- Gateway now derives the canvas host URL via a shared helper for bridge + WS handshakes (avoids loopback pitfalls).
+- `canvas a2ui push` validates JSONL with line errors, rejects v0.9 payloads, and supports `--text` quick renders.
+- `nodes rename` lets you override paired node display names without editing JSON.
+- Android scaffold asset cleanup; iOS canvas/voice wake adjustments.
+
+### Logging & Observability
+- New subsystem console formatter with color modes, shortened prefixes, and TTY detection; browser/gateway logs route through the subsystem logger.
+- WhatsApp console output streamlined; chalk/tslog typing fixes.
+
+### Web UI
+- Chat is now the dashboard landing view; health status simplified; initial scroll animation removed.
+
+### Build, Dev, Docs
+- Notarization flow added for macOS release artifacts; packaging scripts updated.
+- macOS signing auto-selects Developer ID → Apple Distribution → Apple Development; no ad-hoc fallback.
+- Added type-aware oxlint; docs list resolves from cwd; formatting/lint cleanup and dependency bumps (Peekaboo).
+- Docs refreshed for tools, custom model providers, Discord, queue/routing, group activation commands, logging, restart semantics, release notes, GitHub pages CTAs, and npm pitfalls.
+- `pnpm build` now skips A2UI bundling for faster builds (run `pnpm canvas:a2ui:bundle` when needed).
+
+### Tests
+- Coverage added for models config merging, WhatsApp reply context, QR login flows, auto-reply behavior, and gateway SIGTERM timeouts.
+- Added gateway webhook coverage (auth, validation, and summary posting).
+- Vitest now isolates HOME/XDG config roots so tests never touch a real `~/.clawdis` install.
+
+## 2.0.0-beta2 — 2025-12-21
+
+Second beta focused on bundled gateway packaging, skills management, onboarding polish, and provider reliability.
+
+### Highlights
+- Bundled gateway packaging: bun-compiled embedded gateway, new `gateway-daemon` command, launchd support, DMG packaging (zip+DMG).
+- Skills platform: managed/bundled skills, install metadata + installers (uv), skill search + website, media/transcription helpers.
+- macOS app: new Connections settings w/ provider status + QR login, skills settings redesign w/ install targets, models list loaded from the Gateway, clearer local/remote gateway choices.
+- Web/agent UX: tool summary streaming + runtime toggle, WhatsApp QR login tool, agent steering queue, voice wake routes to main session, workspace bootstrap ritual.
+
+### Gateway & providers
+- Gateway: `models.list`, provider status events + RPC coverage, tailscale auth + PAM, bind-mode config, enriched agent WS logs, safer upgrade socket handling, fixed handshake auth crash.
+- WhatsApp Web: QR login flow improvements (logged-out clearing, wait flow), self-chat mode handling, removed batching delay, web inbox made non-blocking.
+- Telegram: normalized chat IDs with clearer error reporting.
+
+### Canvas & browser control
+- Canvas host served on Gateway port; removed standalone canvasHost port config; restored action bridge; refreshed A2UI bundle + message context; bridge canvas host for nodes.
+- A2UI full-screen gutters + status clearance after successful load to avoid overlay collisions.
+- Browser control API simplified; added MCP tool dispatch + native actions; control server can start without Playwright; hook timeouts extended.
+
+### macOS UI polish
+- Onboarding chat UI: kickoff flow, bubble tails, spacing + bottom bar refinements, window sizing tweaks, show Dock icon during onboarding.
+- Skills UI: stabilized action column, fixed install target access, refined list layout and sizing, always show CLI installer.
+- Remote/local gateway: auto-enable local gateway, clearer labels, re-ensure remote tunnel, hide local bridge discovery in remote mode.
+
+### Build, CI, deps
+- Bundled playwright-core + chromium-bidi/long; bun gateway bytecode builds; swiftformat/biome CI fixes; iOS lint script updates; Android icon/compiler updates; ignored new ClawdisKit `.swiftpm` path.
+
+### Docs
+- README architecture refresh + npm header image fix; onboarding/bootstrap steps; skills install guidance + new skills; browser/canvas control docs; bundled gateway + DMG packaging notes.
+
 ## 2.0.0-beta1 — 2025-12-19
 
 First Clawdis release post rebrand. This is a semver-major because we dropped legacy providers/agents and moved defaults to new paths while adding a full macOS companion app, a WebSocket Gateway, and an iOS node.
@@ -9,7 +154,7 @@ First Clawdis release post rebrand. This is a semver-major because we dropped le
 
 ### Breaking
 - Renamed to **Clawdis**: defaults now live under `~/.clawdis` (sessions in `~/.clawdis/sessions/`, IPC at `~/.clawdis/clawdis.sock`, logs in `/tmp/clawdis`). Launchd labels and config filenames follow the new name; legacy stores are copied forward on first run.
-- Pi only: `inbound.reply.agent.kind` accepts only `"pi"`, and the agent CLI/CLI flags for Claude/Codex/Gemini were removed. The Pi CLI runs in RPC mode with a persistent worker.
+- Pi only: only the embedded Pi runtime remains, and the agent CLI/CLI flags for Claude/Codex/Gemini were removed. The Pi CLI runs in RPC mode with a persistent worker.
 - WhatsApp Web is the only transport; Twilio support and related CLI flags/tests were removed.
 - Direct chats now collapse into a single `main` session by default (no config needed); groups stay isolated as `group:<jid>`.
 - Gateway is now a loopback-only WebSocket daemon (`ws://127.0.0.1:18789`) that owns all providers/state; clients (CLI, WebChat, macOS app, nodes) connect to it. Start it explicitly (`clawdis gateway …`) or via Clawdis.app; helper subcommands no longer auto-spawn a gateway.
@@ -57,7 +202,7 @@ First Clawdis release post rebrand. This is a semver-major because we dropped le
 ## 1.5.0 — 2025-12-05
 
 ### Breaking
-- Dropped all non-Pi agents (Claude, Codex, Gemini, Opencode); `inbound.reply.agent.kind` now only accepts `"pi"` and related CLI helpers have been removed.
+- Dropped all non-Pi agents (Claude, Codex, Gemini, Opencode); only the embedded Pi runtime remains and related CLI helpers have been removed.
 - Removed Twilio support and all related commands/options (webhook/up/provider flags/wait-poll); CLAWDIS is Baileys Web-only.
 
 ### Changes
@@ -84,7 +229,7 @@ First Clawdis release post rebrand. This is a semver-major because we dropped le
 ## 1.4.0 — 2025-12-03
 
 ### Highlights
-- **Thinking directives & state:** `/t|/think|/thinking <level>` (aliases off|minimal|low|medium|high|max/highest). Inline applies to that message; directive-only message pins the level for the session; `/think:off` clears. Resolution: inline > session override > `inbound.reply.thinkingDefault` > off. Pi gets `--thinking <level>` (except off); other agents append cue words (`think` → `think hard` → `think harder` → `ultrathink`). Heartbeat probe uses `HEARTBEAT /think:high`.
+- **Thinking directives & state:** `/t|/think|/thinking <level>` (aliases off|minimal|low|medium|high|max/highest). Inline applies to that message; directive-only message pins the level for the session; `/think:off` clears. Resolution: inline > session override > `agent.thinkingDefault` > off. Pi gets `--thinking <level>` (except off); other agents append cue words (`think` → `think hard` → `think harder` → `ultrathink`). Heartbeat probe uses `HEARTBEAT /think:high`.
 - **Group chats (web provider):** Clawdis now fully supports WhatsApp groups: mention-gated triggers (including image-only @ mentions), recent group history injection, per-group sessions, sender attribution, and a first-turn primer with group subject/member roster; heartbeats are skipped for groups.
 - **Group session primer:** The first turn of a group session now tells the agent it is in a WhatsApp group and lists known members/subject so it can address the right speaker.
 - **Media failures are surfaced:** When a web auto-reply media fetch/send fails (e.g., HTTP 404), we now append a warning to the fallback text so you know the attachment was skipped.
@@ -126,7 +271,7 @@ First Clawdis release post rebrand. This is a semver-major because we dropped le
 ## 1.3.0 — 2025-12-02
 
 ### Highlights
-- **Pluggable agents (Claude, Pi, Codex, Opencode):** `inbound.reply.agent` selects CLI/parser; per-agent argv builders and NDJSON parsers enable swapping without template changes.
+- **Pluggable agents (Claude, Pi, Codex, Opencode):** agent selection via config/CLI plus per-agent argv builders and NDJSON parsers enable swapping without template changes.
 - **Safety stop words:** `stop|esc|abort|wait|exit` immediately reply “Agent was aborted.” and mark the session so the next prompt is prefixed with an abort reminder.
 - **Agent session reliability:** Only Claude returns a stable `session_id`; others may reset between runs.
 
@@ -143,7 +288,7 @@ First Clawdis release post rebrand. This is a semver-major because we dropped le
 - Batched inbound messages with timestamps; typing indicator after sends.
 - Watchdog restarts WhatsApp after long inactivity; heartbeat logging includes minutes since last message.
 - Early `allowFrom` filtering before decryption.
-- Same-phone mode with echo detection and optional `inbound.samePhoneMarker`.
+- Same-phone mode with echo detection and optional message prefix marker.
 
 ## 1.2.2 — 2025-11-28
 
@@ -173,10 +318,10 @@ First Clawdis release post rebrand. This is a semver-major because we dropped le
 ## 1.1.0 — 2025-11-26
 
 ### Changes
-- Web auto-replies resize/recompress media and honor `inbound.reply.mediaMaxMb`.
+- Web auto-replies resize/recompress media and honor `agent.mediaMaxMb`.
 - Detect media kind, enforce provider caps (images ≤6MB, audio/video ≤16MB, docs ≤100MB).
 - `session.sendSystemOnce` and optional `sessionIntro`.
-- Typing indicator refresh during commands; configurable via `inbound.reply.typingIntervalSeconds`.
+- Typing indicator refresh during commands; configurable via `agent.typingIntervalSeconds`.
 - Optional audio transcription via external CLI.
 - Command replies return structured payload/meta; respect `mediaMaxMb`; log Claude metadata; include `cwd` in timeout messages.
 - Web provider refactor; logout command; web-only gateway start helper.

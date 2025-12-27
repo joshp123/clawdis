@@ -5,7 +5,7 @@ read_when:
 ---
 # Voice Wake & Push-to-Talk
 
-Updated: 2025-12-12 · Owners: mac app
+Updated: 2025-12-23 · Owners: mac app
 
 ## Modes
 - **Wake-word mode** (default): always-on Speech recognizer waits for trigger tokens (`swabbleTriggerWords`). On match it starts capture, shows the overlay with partial text, and auto-sends after silence.
@@ -13,6 +13,7 @@ Updated: 2025-12-12 · Owners: mac app
 
 ## Runtime behavior (wake-word)
 - Speech recognizer lives in `VoiceWakeRuntime`.
+- Trigger only fires when there’s a **meaningful pause** between the wake word and the next word (~0.45s gap).
 - Silence windows: 2.0s when speech is flowing, 5.0s if only the trigger was heard.
 - Hard stop: 120s to prevent runaway sessions.
 - Debounce between sessions: 350ms.
@@ -45,7 +46,7 @@ Hardening:
 
 ## Forwarding behavior
 - When Voice Wake is enabled, transcripts are forwarded to the active gateway/agent (the same local vs remote mode used by the rest of the mac app).
-- Replies are delivered to the **last-used main surface** (WhatsApp/Telegram/WebChat). If delivery fails, the error is logged and the run is still visible via WebChat/session logs.
+- Replies are delivered to the **last-used main surface** (WhatsApp/Telegram/Discord/WebChat). If delivery fails, the error is logged and the run is still visible via WebChat/session logs.
 
 ## Forwarding payload
 - `VoiceWakeForwarder.prefixedTranscript(_:)` prepends the machine hint before sending. Shared between wake-word and push-to-talk paths.

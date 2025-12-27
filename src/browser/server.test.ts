@@ -318,7 +318,7 @@ describe("browser control server", () => {
       }),
     }).then((r) => r.json())) as { ok: boolean };
     expect(click.ok).toBe(true);
-    expect(pwMocks.clickViaPlaywright).toHaveBeenCalledWith({
+    expect(pwMocks.clickViaPlaywright).toHaveBeenNthCalledWith(1, {
       cdpPort: testPort + 1,
       targetId: "abcd1234",
       ref: "1",
@@ -327,13 +327,27 @@ describe("browser control server", () => {
       modifiers: ["Shift"],
     });
 
+    const clickSelector = await realFetch(`${base}/act`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: "click",
+        selector: "button.save",
+      }),
+    });
+    expect(clickSelector.status).toBe(400);
+    const clickSelectorBody = (await clickSelector.json()) as {
+      error?: string;
+    };
+    expect(clickSelectorBody.error).toMatch(/'selector' is not supported/i);
+
     const type = (await realFetch(`${base}/act`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ kind: "type", ref: "1", text: "" }),
     }).then((r) => r.json())) as { ok: boolean };
     expect(type.ok).toBe(true);
-    expect(pwMocks.typeViaPlaywright).toHaveBeenCalledWith({
+    expect(pwMocks.typeViaPlaywright).toHaveBeenNthCalledWith(1, {
       cdpPort: testPort + 1,
       targetId: "abcd1234",
       ref: "1",

@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import MenuBarExtraAccess
+import Observation
 import OSLog
 import Security
 import SwiftUI
@@ -11,11 +12,12 @@ struct ClawdisApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var state: AppState
     private let gatewayManager = GatewayProcessManager.shared
+    private let controlChannel = ControlChannel.shared
     private let activityStore = WorkActivityStore.shared
     @State private var statusItem: NSStatusItem?
     @State private var isMenuPresented = false
     @State private var isPanelVisible = false
-    @State private var menuInjector = MenuContextCardInjector.shared
+    @State private var tailscaleService = TailscaleService.shared
 
     @MainActor
     private func updateStatusHighlight() {
@@ -35,29 +37,36 @@ struct ClawdisApp: App {
         MenuBarExtra { MenuContent(state: self.state, updater: self.delegate.updaterController) } label: {
             CritterStatusLabel(
                 isPaused: self.state.isPaused,
+                isSleeping: self.isGatewaySleeping,
                 isWorking: self.state.isWorking,
                 earBoostActive: self.state.earBoostActive,
                 blinkTick: self.state.blinkTick,
                 sendCelebrationTick: self.state.sendCelebrationTick,
                 gatewayStatus: self.gatewayManager.status,
-                animationsEnabled: self.state.iconAnimationsEnabled,
+                animationsEnabled: self.state.iconAnimationsEnabled && !self.isGatewaySleeping,
                 iconState: self.effectiveIconState)
         }
         .menuBarExtraStyle(.menu)
         .menuBarExtraAccess(isPresented: self.$isMenuPresented) { item in
             self.statusItem = item
-            self.applyStatusItemAppearance(paused: self.state.isPaused)
+            MenuSessionsInjector.shared.install(into: item)
+            self.applyStatusItemAppearance(paused: self.state.isPaused, sleeping: self.isGatewaySleeping)
             self.installStatusItemMouseHandler(for: item)
-            self.menuInjector.install(into: item)
             self.updateHoverHUDSuppression()
         }
         .onChange(of: self.state.isPaused) { _, paused in
-            self.applyStatusItemAppearance(paused: paused)
+            self.applyStatusItemAppearance(paused: paused, sleeping: self.isGatewaySleeping)
             if self.state.connectionMode == .local {
                 self.gatewayManager.setActive(!paused)
             } else {
                 self.gatewayManager.stop()
             }
+        }
+        .onChange(of: self.controlChannel.state) { _, _ in
+            self.applyStatusItemAppearance(paused: self.state.isPaused, sleeping: self.isGatewaySleeping)
+        }
+        .onChange(of: self.gatewayManager.status) { _, _ in
+            self.applyStatusItemAppearance(paused: self.state.isPaused, sleeping: self.isGatewaySleeping)
         }
         .onChange(of: self.state.connectionMode) { _, mode in
             Task { await ConnectionModeCoordinator.shared.apply(mode: mode, paused: self.state.isPaused) }
@@ -66,6 +75,7 @@ struct ClawdisApp: App {
         Settings {
             SettingsRootView(state: self.state, updater: self.delegate.updaterController)
                 .frame(width: SettingsTab.windowWidth, height: SettingsTab.windowHeight, alignment: .topLeading)
+                .environment(self.tailscaleService)
         }
         .defaultSize(width: SettingsTab.windowWidth, height: SettingsTab.windowHeight)
         .windowResizability(.contentSize)
@@ -75,8 +85,27 @@ struct ClawdisApp: App {
         }
     }
 
-    private func applyStatusItemAppearance(paused: Bool) {
-        self.statusItem?.button?.appearsDisabled = paused
+    private func applyStatusItemAppearance(paused: Bool, sleeping: Bool) {
+        self.statusItem?.button?.appearsDisabled = paused || sleeping
+    }
+
+    private var isGatewaySleeping: Bool {
+        if self.state.isPaused { return false }
+        switch self.state.connectionMode {
+        case .unconfigured:
+            return true
+        case .remote:
+            if case .connected = self.controlChannel.state { return false }
+            return true
+        case .local:
+            switch self.gatewayManager.status {
+            case .running, .starting, .attachedExisting:
+                if case .connected = self.controlChannel.state { return false }
+                return true
+            case .failed, .stopped:
+                return true
+            }
+        }
     }
 
     @MainActor
@@ -199,6 +228,7 @@ private final class StatusItemMouseHandlerView: NSView {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var state: AppState?
     private let webChatAutoLogger = Logger(subsystem: "com.steipete.clawdis", category: "Chat")
@@ -278,28 +308,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 protocol UpdaterProviding: AnyObject {
     var automaticallyChecksForUpdates: Bool { get set }
+    var automaticallyDownloadsUpdates: Bool { get set }
     var isAvailable: Bool { get }
+    var updateStatus: UpdateStatus { get }
     func checkForUpdates(_ sender: Any?)
 }
 
 // No-op updater used for debug/dev runs to suppress Sparkle dialogs.
 final class DisabledUpdaterController: UpdaterProviding {
     var automaticallyChecksForUpdates: Bool = false
+    var automaticallyDownloadsUpdates: Bool = false
     let isAvailable: Bool = false
+    let updateStatus = UpdateStatus()
     func checkForUpdates(_: Any?) {}
+}
+
+@MainActor
+@Observable
+final class UpdateStatus {
+    static let disabled = UpdateStatus()
+    var isUpdateReady: Bool
+
+    init(isUpdateReady: Bool = false) {
+        self.isUpdateReady = isUpdateReady
+    }
 }
 
 #if canImport(Sparkle)
 import Sparkle
 
-extension SPUStandardUpdaterController: UpdaterProviding {
+@MainActor
+final class SparkleUpdaterController: NSObject, UpdaterProviding {
+    private lazy var controller = SPUStandardUpdaterController(
+        startingUpdater: false,
+        updaterDelegate: self,
+        userDriverDelegate: nil)
+    let updateStatus = UpdateStatus()
+
+    init(savedAutoUpdate: Bool) {
+        super.init()
+        let updater = self.controller.updater
+        updater.automaticallyChecksForUpdates = savedAutoUpdate
+        updater.automaticallyDownloadsUpdates = savedAutoUpdate
+        self.controller.startUpdater()
+    }
+
     var automaticallyChecksForUpdates: Bool {
-        get { self.updater.automaticallyChecksForUpdates }
-        set { self.updater.automaticallyChecksForUpdates = newValue }
+        get { self.controller.updater.automaticallyChecksForUpdates }
+        set { self.controller.updater.automaticallyChecksForUpdates = newValue }
+    }
+
+    var automaticallyDownloadsUpdates: Bool {
+        get { self.controller.updater.automaticallyDownloadsUpdates }
+        set { self.controller.updater.automaticallyDownloadsUpdates = newValue }
     }
 
     var isAvailable: Bool { true }
+
+    func checkForUpdates(_ sender: Any?) {
+        self.controller.checkForUpdates(sender)
+    }
+
+    func updater(_ updater: SPUUpdater, didDownloadUpdate item: SUAppcastItem) {
+        self.updateStatus.isUpdateReady = true
+    }
+
+    func updater(_ updater: SPUUpdater, failedToDownloadUpdate item: SUAppcastItem, error: Error) {
+        self.updateStatus.isUpdateReady = false
+    }
+
+    func userDidCancelDownload(_ updater: SPUUpdater) {
+        self.updateStatus.isUpdateReady = false
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        userDidMakeChoice choice: SPUUserUpdateChoice,
+        forUpdate updateItem: SUAppcastItem,
+        state: SPUUserUpdateState)
+    {
+        switch choice {
+        case .install, .skip:
+            self.updateStatus.isUpdateReady = false
+        case .dismiss:
+            self.updateStatus.isUpdateReady = (state.stage == .downloaded)
+        @unknown default:
+            self.updateStatus.isUpdateReady = false
+        }
+    }
 }
+
+extension SparkleUpdaterController: @preconcurrency SPUUpdaterDelegate {}
 
 private func isDeveloperIDSigned(bundleURL: URL) -> Bool {
     var staticCode: SecStaticCode?
@@ -322,6 +421,7 @@ private func isDeveloperIDSigned(bundleURL: URL) -> Bool {
     return false
 }
 
+@MainActor
 private func makeUpdaterController() -> UpdaterProviding {
     let bundleURL = Bundle.main.bundleURL
     let isBundledApp = bundleURL.pathExtension == "app"
@@ -331,16 +431,10 @@ private func makeUpdaterController() -> UpdaterProviding {
     let autoUpdateKey = "autoUpdateEnabled"
     // Default to true; honor the user's last choice otherwise.
     let savedAutoUpdate = (defaults.object(forKey: autoUpdateKey) as? Bool) ?? true
-
-    let controller = SPUStandardUpdaterController(
-        startingUpdater: false,
-        updaterDelegate: nil,
-        userDriverDelegate: nil)
-    controller.updater.automaticallyChecksForUpdates = savedAutoUpdate
-    controller.startUpdater()
-    return controller
+    return SparkleUpdaterController(savedAutoUpdate: savedAutoUpdate)
 }
 #else
+@MainActor
 private func makeUpdaterController() -> UpdaterProviding {
     DisabledUpdaterController()
 }

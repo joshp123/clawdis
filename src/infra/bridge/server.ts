@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import net from "node:net";
 import os from "node:os";
 
+import { resolveCanvasHostUrl } from "../canvas-host-url.js";
 import {
   getPairedNode,
   listNodePairing,
@@ -117,6 +118,7 @@ export type NodeBridgeServer = {
     payloadJSON?: string | null;
   }) => void;
   listConnected: () => NodeBridgeClientInfo[];
+  listeners: Array<{ host: string; port: number }>;
 };
 
 export type NodeBridgeClientInfo = {
@@ -137,6 +139,7 @@ export type NodeBridgeServerOpts = {
   port: number; // 0 = ephemeral
   pairingBaseDir?: string;
   canvasHostPort?: number;
+  canvasHostHost?: string;
   onEvent?: (nodeId: string, evt: BridgeEventFrame) => Promise<void> | void;
   onRequest?: (
     nodeId: string,
@@ -177,6 +180,7 @@ export async function startNodeBridgeServer(
       },
       sendEvent: () => {},
       listConnected: () => [],
+      listeners: [],
     };
   }
 
@@ -186,12 +190,12 @@ export async function startNodeBridgeServer(
       : os.hostname();
 
   const buildCanvasHostUrl = (socket: net.Socket) => {
-    const port = opts.canvasHostPort;
-    if (!port) return undefined;
-    const host = socket.localAddress?.trim();
-    if (!host) return undefined;
-    const formatted = host.includes(":") ? `[${host}]` : host;
-    return `http://${formatted}:${port}`;
+    return resolveCanvasHostUrl({
+      canvasPort: opts.canvasHostPort,
+      hostOverride: opts.canvasHostHost,
+      localAddress: socket.localAddress,
+      scheme: "http",
+    });
   };
 
   type ConnectionState = {
@@ -209,7 +213,21 @@ export async function startNodeBridgeServer(
 
   const connections = new Map<string, ConnectionState>();
 
-  const server = net.createServer((socket) => {
+  const shouldAlsoListenOnLoopback = (host: string | undefined) => {
+    const h = String(host ?? "")
+      .trim()
+      .toLowerCase();
+    if (!h) return false; // default listen() already includes loopback
+    if (h === "0.0.0.0" || h === "::") return false; // already includes loopback
+    if (h === "localhost") return false;
+    if (h === "127.0.0.1" || h.startsWith("127.")) return false;
+    if (h === "::1") return false;
+    return true;
+  };
+
+  const loopbackHost = "127.0.0.1";
+
+  const onConnection = (socket: net.Socket) => {
     socket.setNoDelay(true);
 
     let buffer = "";
@@ -329,8 +347,9 @@ export async function startNodeBridgeServer(
           ? hello.commands.map((c) => String(c)).filter(Boolean)
           : verified.node.commands;
       const helloPermissions = normalizePermissions(hello.permissions);
+      const basePermissions = verified.node.permissions ?? {};
       const permissions = helloPermissions
-        ? { ...(verified.node.permissions ?? {}), ...helloPermissions }
+        ? { ...basePermissions, ...helloPermissions }
         : verified.node.permissions;
 
       isAuthenticated = true;
@@ -655,16 +674,47 @@ export async function startNodeBridgeServer(
     socket.on("error", () => {
       // close handler will run after close
     });
-  });
+  };
 
+  const listeners: Array<{ host: string; server: net.Server }> = [];
+  const primary = net.createServer(onConnection);
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(opts.port, opts.host, () => resolve());
+    const onError = (err: Error) => reject(err);
+    primary.once("error", onError);
+    primary.listen(opts.port, opts.host, () => {
+      primary.off("error", onError);
+      resolve();
+    });
+  });
+  listeners.push({
+    host: String(opts.host ?? "").trim() || "(default)",
+    server: primary,
   });
 
-  const address = server.address();
+  const address = primary.address();
   const port =
     typeof address === "object" && address ? address.port : opts.port;
+
+  if (shouldAlsoListenOnLoopback(opts.host)) {
+    const loopback = net.createServer(onConnection);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onError = (err: Error) => reject(err);
+        loopback.once("error", onError);
+        loopback.listen(port, loopbackHost, () => {
+          loopback.off("error", onError);
+          resolve();
+        });
+      });
+      listeners.push({ host: loopbackHost, server: loopback });
+    } catch {
+      try {
+        loopback.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 
   return {
     port,
@@ -677,11 +727,17 @@ export async function startNodeBridgeServer(
         }
       }
       connections.clear();
-      await new Promise<void>((resolve, reject) =>
-        server.close((err) => (err ? reject(err) : resolve())),
+      await Promise.all(
+        listeners.map(
+          (l) =>
+            new Promise<void>((resolve, reject) =>
+              l.server.close((err) => (err ? reject(err) : resolve())),
+            ),
+        ),
       );
     },
     listConnected: () => [...connections.values()].map((c) => c.nodeInfo),
+    listeners: listeners.map((l) => ({ host: l.host, port })),
     sendEvent: ({ nodeId, event, payloadJSON }) => {
       const normalizedNodeId = String(nodeId ?? "").trim();
       const normalizedEvent = String(event ?? "").trim();

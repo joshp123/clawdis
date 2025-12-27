@@ -332,7 +332,7 @@ export async function createCanvasHostHandler(
       const mime =
         lower.endsWith(".html") || lower.endsWith(".htm")
           ? "text/html"
-          : (detectMime({ filePath }) ?? "application/octet-stream");
+          : ((await detectMime({ filePath })) ?? "application/octet-stream");
 
       res.setHeader("Cache-Control", "no-store");
       if (mime === "text/html") {
@@ -377,7 +377,7 @@ export async function startCanvasHost(
   const handler = await createCanvasHostHandler({
     runtime: opts.runtime,
     rootDir: opts.rootDir,
-    basePath: "/",
+    basePath: CANVAS_HOST_PATH,
     allowInTests: opts.allowInTests,
   });
 

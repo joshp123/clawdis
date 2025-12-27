@@ -6,8 +6,18 @@ import {
   DEFAULT_MODEL,
   DEFAULT_PROVIDER,
 } from "../agents/defaults.js";
+import { loadModelCatalog } from "../agents/model-catalog.js";
 import {
+  buildAllowedModelSet,
+  buildModelAliasIndex,
+  modelKey,
+  resolveConfiguredModelRef,
+  resolveModelRefFromString,
+} from "../agents/model-selection.js";
+import {
+  abortEmbeddedPiRun,
   queueEmbeddedPiMessage,
+  resolveEmbeddedSessionLane,
   runEmbeddedPiAgent,
 } from "../agents/pi-embedded.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
@@ -18,7 +28,7 @@ import {
 import { type ClawdisConfig, loadConfig } from "../config/config.js";
 import {
   DEFAULT_IDLE_MINUTES,
-  DEFAULT_RESET_TRIGGER,
+  DEFAULT_RESET_TRIGGERS,
   loadSessionStore,
   resolveSessionKey,
   resolveSessionTranscriptPath,
@@ -29,10 +39,20 @@ import {
 import { logVerbose } from "../globals.js";
 import { buildProviderSummary } from "../infra/provider-summary.js";
 import { triggerClawdisRestart } from "../infra/restart.js";
-import { drainSystemEvents } from "../infra/system-events.js";
+import {
+  drainSystemEvents,
+  enqueueSystemEvent,
+} from "../infra/system-events.js";
+import { clearCommandLane, getQueueSize } from "../process/command-queue.js";
 import { defaultRuntime } from "../runtime.js";
+import { normalizeE164 } from "../utils.js";
 import { resolveHeartbeatSeconds } from "../web/reconnect.js";
 import { getWebAuthAgeMs, webAuthExists } from "../web/session.js";
+import {
+  normalizeGroupActivation,
+  parseActivationCommand,
+} from "./group-activation.js";
+import { extractModelDirective } from "./model.js";
 import { buildStatusMessage } from "./status.js";
 import type { MsgContext, TemplateContext } from "./templating.js";
 import {
@@ -41,6 +61,7 @@ import {
   type ThinkLevel,
   type VerboseLevel,
 } from "./thinking.js";
+import { SILENT_REPLY_TOKEN } from "./tokens.js";
 import { isAudio, transcribeInboundAudio } from "./transcription.js";
 import type { GetReplyOptions, ReplyPayload } from "./types.js";
 
@@ -51,7 +72,9 @@ const ABORT_MEMORY = new Map<string, boolean>();
 const SYSTEM_MARK = "⚙️";
 
 const BARE_SESSION_RESET_PROMPT =
-  "A new session was started via /new. Say hi briefly and ask what the user wants to do next.";
+  "A new session was started via /new or /reset. Say hi briefly (1-2 sentences) and ask what the user wants to do next. Do not mention internal steps, files, tools, or reasoning.";
+
+type QueueMode = "queue" | "interrupt";
 
 export function extractThinkDirective(body?: string): {
   cleaned: string;
@@ -98,6 +121,45 @@ export function extractVerboseDirective(body?: string): {
   };
 }
 
+function normalizeQueueMode(raw?: string): QueueMode | undefined {
+  if (!raw) return undefined;
+  const cleaned = raw.trim().toLowerCase();
+  if (cleaned === "queue" || cleaned === "queued") return "queue";
+  if (
+    cleaned === "interrupt" ||
+    cleaned === "interrupts" ||
+    cleaned === "abort"
+  )
+    return "interrupt";
+  return undefined;
+}
+
+export function extractQueueDirective(body?: string): {
+  cleaned: string;
+  queueMode?: QueueMode;
+  queueReset: boolean;
+  rawMode?: string;
+  hasDirective: boolean;
+} {
+  if (!body) return { cleaned: "", hasDirective: false, queueReset: false };
+  const match = body.match(/(?:^|\s)\/queue(?=$|\s|:)\s*:?\s*([a-zA-Z-]+)\b/i);
+  const rawMode = match?.[1];
+  const lowered = rawMode?.trim().toLowerCase();
+  const queueReset =
+    lowered === "default" || lowered === "reset" || lowered === "clear";
+  const queueMode = queueReset ? undefined : normalizeQueueMode(rawMode);
+  const cleaned = match
+    ? body.replace(match[0], "").replace(/\s+/g, " ").trim()
+    : body.trim();
+  return {
+    cleaned,
+    queueMode,
+    queueReset,
+    rawMode,
+    hasDirective: !!match,
+  };
+}
+
 function isAbortTrigger(text?: string): boolean {
   if (!text) return false;
   const normalized = text.trim().toLowerCase();
@@ -124,7 +186,7 @@ function stripMentions(
   cfg: ClawdisConfig | undefined,
 ): string {
   let result = text;
-  const patterns = cfg?.inbound?.groupChat?.mentionPatterns ?? [];
+  const patterns = cfg?.routing?.groupChat?.mentionPatterns ?? [];
   for (const p of patterns) {
     try {
       const re = new RegExp(p, "gi");
@@ -142,7 +204,39 @@ function stripMentions(
   }
   // Generic mention patterns like @123456789 or plain digits
   result = result.replace(/@[0-9+]{5,}/g, " ");
+  // Discord-style mentions (<@123> or <@!123>)
+  result = result.replace(/<@!?\d+>/g, " ");
   return result.replace(/\s+/g, " ").trim();
+}
+
+function defaultQueueModeForSurface(surface?: string): QueueMode {
+  const normalized = surface?.trim().toLowerCase();
+  if (normalized === "discord") return "queue";
+  if (normalized === "webchat") return "queue";
+  return "interrupt";
+}
+
+function resolveQueueMode(params: {
+  cfg: ClawdisConfig;
+  surface?: string;
+  sessionEntry?: SessionEntry;
+  inlineMode?: QueueMode;
+}): QueueMode {
+  const surfaceKey = params.surface?.trim().toLowerCase();
+  const queueCfg = params.cfg.routing?.queue;
+  const surfaceMode =
+    surfaceKey && queueCfg?.bySurface
+      ? (queueCfg.bySurface as Record<string, QueueMode | undefined>)[
+          surfaceKey
+        ]
+      : undefined;
+  return (
+    params.inlineMode ??
+    params.sessionEntry?.queueMode ??
+    surfaceMode ??
+    queueCfg?.mode ??
+    defaultQueueModeForSurface(surfaceKey)
+  );
 }
 
 export async function getReplyFromConfig(
@@ -151,13 +245,35 @@ export async function getReplyFromConfig(
   configOverride?: ClawdisConfig,
 ): Promise<ReplyPayload | ReplyPayload[] | undefined> {
   const cfg = configOverride ?? loadConfig();
-  const workspaceDirRaw = cfg.inbound?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
-  const agentCfg = cfg.inbound?.agent;
-  const sessionCfg = cfg.inbound?.session;
+  const workspaceDirRaw = cfg.agent?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
+  const agentCfg = cfg.agent;
+  const sessionCfg = cfg.session;
 
-  const provider = agentCfg?.provider?.trim() || DEFAULT_PROVIDER;
-  const model = agentCfg?.model?.trim() || DEFAULT_MODEL;
-  const contextTokens =
+  const mainModel = resolveConfiguredModelRef({
+    cfg,
+    defaultProvider: DEFAULT_PROVIDER,
+    defaultModel: DEFAULT_MODEL,
+  });
+  const defaultProvider = mainModel.provider;
+  const defaultModel = mainModel.model;
+  const aliasIndex = buildModelAliasIndex({ cfg, defaultProvider });
+  let provider = defaultProvider;
+  let model = defaultModel;
+  if (opts?.isHeartbeat) {
+    const heartbeatRaw = agentCfg?.heartbeat?.model?.trim() ?? "";
+    const heartbeatRef = heartbeatRaw
+      ? resolveModelRefFromString({
+          raw: heartbeatRaw,
+          defaultProvider,
+          aliasIndex,
+        })
+      : null;
+    if (heartbeatRef) {
+      provider = heartbeatRef.ref.provider;
+      model = heartbeatRef.ref.model;
+    }
+  }
+  let contextTokens =
     agentCfg?.contextTokens ??
     lookupContextTokens(model) ??
     DEFAULT_CONTEXT_TOKENS;
@@ -181,10 +297,11 @@ export async function getReplyFromConfig(
     await triggerTyping();
   };
   let typingTimer: NodeJS.Timeout | undefined;
-  const typingIntervalMs =
-    (agentCfg?.typingIntervalSeconds ??
-      sessionCfg?.typingIntervalSeconds ??
-      8) * 1000;
+  const configuredTypingSeconds =
+    agentCfg?.typingIntervalSeconds ?? sessionCfg?.typingIntervalSeconds;
+  const typingIntervalSeconds =
+    typeof configuredTypingSeconds === "number" ? configuredTypingSeconds : 6;
+  const typingIntervalMs = typingIntervalSeconds * 1000;
   const cleanupTyping = () => {
     if (typingTimer) {
       clearInterval(typingTimer);
@@ -195,15 +312,21 @@ export async function getReplyFromConfig(
     if (!opts?.onReplyStart) return;
     if (typingIntervalMs <= 0) return;
     if (typingTimer) return;
-    await triggerTyping();
+    await onReplyStart();
     typingTimer = setInterval(() => {
       void triggerTyping();
     }, typingIntervalMs);
   };
+  const startTypingOnText = async (text?: string) => {
+    const trimmed = text?.trim();
+    if (!trimmed) return;
+    if (trimmed === SILENT_REPLY_TOKEN) return;
+    await startTypingLoop();
+  };
   let transcribedText: string | undefined;
 
   // Optional audio transcription before templating/session handling.
-  if (cfg.inbound?.transcribeAudio && isAudio(ctx.MediaType)) {
+  if (cfg.routing?.transcribeAudio && isAudio(ctx.MediaType)) {
     const transcribed = await transcribeInboundAudio(cfg, ctx, defaultRuntime);
     if (transcribed?.text) {
       transcribedText = transcribed.text;
@@ -217,7 +340,7 @@ export async function getReplyFromConfig(
   const mainKey = sessionCfg?.mainKey ?? "main";
   const resetTriggers = sessionCfg?.resetTriggers?.length
     ? sessionCfg.resetTriggers
-    : [DEFAULT_RESET_TRIGGER];
+    : DEFAULT_RESET_TRIGGERS;
   const idleMinutes = Math.max(
     sessionCfg?.idleMinutes ?? DEFAULT_IDLE_MINUTES,
     1,
@@ -236,7 +359,12 @@ export async function getReplyFromConfig(
 
   let persistedThinking: string | undefined;
   let persistedVerbose: string | undefined;
+  let persistedModelOverride: string | undefined;
+  let persistedProviderOverride: string | undefined;
 
+  const isGroup =
+    typeof ctx.From === "string" &&
+    (ctx.From.includes("@g.us") || ctx.From.startsWith("group:"));
   const triggerBodyNormalized = stripStructuralPrefixes(ctx.Body ?? "")
     .trim()
     .toLowerCase();
@@ -246,7 +374,9 @@ export async function getReplyFromConfig(
   // Timestamp/message prefixes (e.g. "[Dec 4 17:35] ") are added by the
   // web inbox before we get here. They prevented reset triggers like "/new"
   // from matching, so strip structural wrappers when checking for resets.
-  const strippedForReset = triggerBodyNormalized;
+  const strippedForReset = isGroup
+    ? stripMentions(triggerBodyNormalized, ctx, cfg)
+    : triggerBodyNormalized;
   for (const trigger of resetTriggers) {
     if (!trigger) continue;
     if (trimmedBody === trigger || strippedForReset === trigger) {
@@ -277,6 +407,8 @@ export async function getReplyFromConfig(
     abortedLastRun = entry.abortedLastRun ?? false;
     persistedThinking = entry.thinkingLevel;
     persistedVerbose = entry.verboseLevel;
+    persistedModelOverride = entry.modelOverride;
+    persistedProviderOverride = entry.providerOverride;
   } else {
     sessionId = crypto.randomUUID();
     isNewSession = true;
@@ -294,6 +426,9 @@ export async function getReplyFromConfig(
     // Persist previously stored thinking/verbose levels when present.
     thinkingLevel: persistedThinking ?? baseEntry?.thinkingLevel,
     verboseLevel: persistedVerbose ?? baseEntry?.verboseLevel,
+    modelOverride: persistedModelOverride ?? baseEntry?.modelOverride,
+    providerOverride: persistedProviderOverride ?? baseEntry?.providerOverride,
+    queueMode: baseEntry?.queueMode,
   };
   sessionStore[sessionKey] = sessionEntry;
   await saveSessionStore(storePath, sessionStore);
@@ -317,12 +452,25 @@ export async function getReplyFromConfig(
     rawLevel: rawVerboseLevel,
     hasDirective: hasVerboseDirective,
   } = extractVerboseDirective(thinkCleaned);
-  sessionCtx.Body = verboseCleaned;
-  sessionCtx.BodyStripped = verboseCleaned;
+  const {
+    cleaned: modelCleaned,
+    rawModel: rawModelDirective,
+    hasDirective: hasModelDirective,
+  } = extractModelDirective(verboseCleaned);
+  const {
+    cleaned: queueCleaned,
+    queueMode: inlineQueueMode,
+    queueReset: inlineQueueReset,
+    rawMode: rawQueueMode,
+    hasDirective: hasQueueDirective,
+  } = extractQueueDirective(modelCleaned);
+  sessionCtx.Body = queueCleaned;
+  sessionCtx.BodyStripped = queueCleaned;
 
-  const isGroup =
-    typeof ctx.From === "string" &&
-    (ctx.From.includes("@g.us") || ctx.From.startsWith("group:"));
+  const defaultGroupActivation = () => {
+    const requireMention = cfg.routing?.groupChat?.requireMention;
+    return requireMention === false ? "always" : "mention";
+  };
 
   let resolvedThinkLevel =
     inlineThink ??
@@ -348,117 +496,239 @@ export async function getReplyFromConfig(
     return resolvedVerboseLevel === "on";
   };
 
-  const combinedDirectiveOnly =
-    hasThinkDirective &&
-    hasVerboseDirective &&
-    (() => {
-      const stripped = stripStructuralPrefixes(verboseCleaned ?? "");
-      const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
-      return noMentions.length === 0;
-    })();
+  const hasAllowlist = (agentCfg?.allowedModels?.length ?? 0) > 0;
+  const hasStoredOverride = Boolean(
+    sessionEntry?.modelOverride || sessionEntry?.providerOverride,
+  );
+  const needsModelCatalog =
+    hasModelDirective || hasAllowlist || hasStoredOverride;
+  let allowedModelKeys = new Set<string>();
+  let allowedModelCatalog: Awaited<ReturnType<typeof loadModelCatalog>> = [];
+  let resetModelOverride = false;
+
+  if (needsModelCatalog) {
+    const catalog = await loadModelCatalog({ config: cfg });
+    const allowed = buildAllowedModelSet({
+      cfg,
+      catalog,
+      defaultProvider,
+    });
+    allowedModelCatalog = allowed.allowedCatalog;
+    allowedModelKeys = allowed.allowedKeys;
+  }
+
+  if (sessionEntry && sessionStore && sessionKey && hasStoredOverride) {
+    const overrideProvider =
+      sessionEntry.providerOverride?.trim() || defaultProvider;
+    const overrideModel = sessionEntry.modelOverride?.trim();
+    if (overrideModel) {
+      const key = modelKey(overrideProvider, overrideModel);
+      if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
+        delete sessionEntry.providerOverride;
+        delete sessionEntry.modelOverride;
+        sessionEntry.updatedAt = Date.now();
+        sessionStore[sessionKey] = sessionEntry;
+        await saveSessionStore(storePath, sessionStore);
+        resetModelOverride = true;
+      }
+    }
+  }
+
+  const storedProviderOverride = sessionEntry?.providerOverride?.trim();
+  const storedModelOverride = sessionEntry?.modelOverride?.trim();
+  if (storedModelOverride) {
+    const candidateProvider = storedProviderOverride || defaultProvider;
+    const key = modelKey(candidateProvider, storedModelOverride);
+    if (allowedModelKeys.size === 0 || allowedModelKeys.has(key)) {
+      provider = candidateProvider;
+      model = storedModelOverride;
+    }
+  }
+  contextTokens =
+    agentCfg?.contextTokens ??
+    lookupContextTokens(model) ??
+    DEFAULT_CONTEXT_TOKENS;
+
+  const initialModelLabel = `${provider}/${model}`;
+  const formatModelSwitchEvent = (label: string, alias?: string) =>
+    alias
+      ? `Model switched to ${alias} (${label}).`
+      : `Model switched to ${label}.`;
+  const isModelListAlias =
+    hasModelDirective && rawModelDirective?.trim().toLowerCase() === "status";
+  const effectiveModelDirective = isModelListAlias
+    ? undefined
+    : rawModelDirective;
 
   const directiveOnly = (() => {
-    if (!hasThinkDirective) return false;
-    if (!thinkCleaned) return true;
-    // Check after stripping both think and verbose so combined directives count.
-    const stripped = stripStructuralPrefixes(verboseCleaned);
+    if (
+      !hasThinkDirective &&
+      !hasVerboseDirective &&
+      !hasModelDirective &&
+      !hasQueueDirective
+    )
+      return false;
+    const stripped = stripStructuralPrefixes(queueCleaned ?? "");
     const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
     return noMentions.length === 0;
   })();
 
-  // Directive-only message => persist session thinking level and return ack
-  if (directiveOnly || combinedDirectiveOnly) {
-    if (!inlineThink) {
+  if (directiveOnly) {
+    if (hasModelDirective && (!rawModelDirective || isModelListAlias)) {
+      if (allowedModelCatalog.length === 0) {
+        cleanupTyping();
+        return { text: "No models available." };
+      }
+      const current = `${provider}/${model}`;
+      const defaultLabel = `${defaultProvider}/${defaultModel}`;
+      const header =
+        current === defaultLabel
+          ? `Models (current: ${current}):`
+          : `Models (current: ${current}, default: ${defaultLabel}):`;
+      const lines = [header];
+      if (resetModelOverride) {
+        lines.push(`(previous selection reset to default)`);
+      }
+      for (const entry of allowedModelCatalog) {
+        const label = `${entry.provider}/${entry.id}`;
+        const aliases = aliasIndex.byKey.get(label);
+        const aliasSuffix =
+          aliases && aliases.length > 0
+            ? ` (alias: ${aliases.join(", ")})`
+            : "";
+        const suffix =
+          entry.name && entry.name !== entry.id ? ` — ${entry.name}` : "";
+        lines.push(`- ${label}${aliasSuffix}${suffix}`);
+      }
+      cleanupTyping();
+      return { text: lines.join("\n") };
+    }
+    if (hasThinkDirective && !inlineThink) {
       cleanupTyping();
       return {
         text: `Unrecognized thinking level "${rawThinkLevel ?? ""}". Valid levels: off, minimal, low, medium, high.`,
       };
     }
-    if (sessionEntry && sessionStore && sessionKey) {
-      if (inlineThink === "off") {
-        delete sessionEntry.thinkingLevel;
-      } else {
-        sessionEntry.thinkingLevel = inlineThink;
-      }
-      sessionEntry.updatedAt = Date.now();
-      sessionStore[sessionKey] = sessionEntry;
-      await saveSessionStore(storePath, sessionStore);
-    }
-    // If verbose directive is also present, persist it too.
-    if (
-      hasVerboseDirective &&
-      inlineVerbose &&
-      sessionEntry &&
-      sessionStore &&
-      sessionKey
-    ) {
-      if (inlineVerbose === "off") {
-        delete sessionEntry.verboseLevel;
-      } else {
-        sessionEntry.verboseLevel = inlineVerbose;
-      }
-      sessionEntry.updatedAt = Date.now();
-      sessionStore[sessionKey] = sessionEntry;
-      await saveSessionStore(storePath, sessionStore);
-    }
-    const parts: string[] = [];
-    if (inlineThink === "off") {
-      parts.push("Thinking disabled.");
-    } else {
-      parts.push(`Thinking level set to ${inlineThink}.`);
-    }
-    if (hasVerboseDirective) {
-      if (!inlineVerbose) {
-        parts.push(
-          `Unrecognized verbose level "${rawVerboseLevel ?? ""}". Valid levels: off, on.`,
-        );
-      } else {
-        parts.push(
-          inlineVerbose === "off"
-            ? "Verbose logging disabled."
-            : "Verbose logging enabled.",
-        );
-      }
-    }
-    const ack = parts.join(" ");
-    cleanupTyping();
-    return { text: ack };
-  }
-
-  const verboseDirectiveOnly = (() => {
-    if (!hasVerboseDirective) return false;
-    if (!verboseCleaned) return true;
-    const stripped = stripStructuralPrefixes(verboseCleaned);
-    const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
-    return noMentions.length === 0;
-  })();
-
-  if (verboseDirectiveOnly) {
-    if (!inlineVerbose) {
+    if (hasVerboseDirective && !inlineVerbose) {
       cleanupTyping();
       return {
         text: `Unrecognized verbose level "${rawVerboseLevel ?? ""}". Valid levels: off, on.`,
       };
     }
+    if (hasQueueDirective && !inlineQueueMode && !inlineQueueReset) {
+      cleanupTyping();
+      return {
+        text: `Unrecognized queue mode "${rawQueueMode ?? ""}". Valid modes: queue, interrupt.`,
+      };
+    }
+
+    let modelSelection:
+      | { provider: string; model: string; isDefault: boolean; alias?: string }
+      | undefined;
+    if (hasModelDirective && effectiveModelDirective) {
+      const resolved = resolveModelRefFromString({
+        raw: effectiveModelDirective,
+        defaultProvider,
+        aliasIndex,
+      });
+      if (!resolved) {
+        cleanupTyping();
+        return {
+          text: `Unrecognized model "${effectiveModelDirective}". Use /model to list available models.`,
+        };
+      }
+      const key = modelKey(resolved.ref.provider, resolved.ref.model);
+      if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
+        cleanupTyping();
+        return {
+          text: `Model "${resolved.ref.provider}/${resolved.ref.model}" is not allowed. Use /model to list available models.`,
+        };
+      }
+      const isDefault =
+        resolved.ref.provider === defaultProvider &&
+        resolved.ref.model === defaultModel;
+      modelSelection = {
+        provider: resolved.ref.provider,
+        model: resolved.ref.model,
+        isDefault,
+        alias: resolved.alias,
+      };
+      const nextLabel = `${modelSelection.provider}/${modelSelection.model}`;
+      if (nextLabel !== initialModelLabel) {
+        enqueueSystemEvent(
+          formatModelSwitchEvent(nextLabel, modelSelection.alias),
+          {
+            contextKey: `model:${nextLabel}`,
+          },
+        );
+      }
+    }
+
     if (sessionEntry && sessionStore && sessionKey) {
-      if (inlineVerbose === "off") {
-        delete sessionEntry.verboseLevel;
-      } else {
-        sessionEntry.verboseLevel = inlineVerbose;
+      if (hasThinkDirective && inlineThink) {
+        if (inlineThink === "off") delete sessionEntry.thinkingLevel;
+        else sessionEntry.thinkingLevel = inlineThink;
+      }
+      if (hasVerboseDirective && inlineVerbose) {
+        if (inlineVerbose === "off") delete sessionEntry.verboseLevel;
+        else sessionEntry.verboseLevel = inlineVerbose;
+      }
+      if (modelSelection) {
+        if (modelSelection.isDefault) {
+          delete sessionEntry.providerOverride;
+          delete sessionEntry.modelOverride;
+        } else {
+          sessionEntry.providerOverride = modelSelection.provider;
+          sessionEntry.modelOverride = modelSelection.model;
+        }
+      }
+      if (hasQueueDirective && inlineQueueReset) {
+        delete sessionEntry.queueMode;
+      } else if (hasQueueDirective && inlineQueueMode) {
+        sessionEntry.queueMode = inlineQueueMode;
       }
       sessionEntry.updatedAt = Date.now();
       sessionStore[sessionKey] = sessionEntry;
       await saveSessionStore(storePath, sessionStore);
     }
-    const ack =
-      inlineVerbose === "off"
-        ? `${SYSTEM_MARK} Verbose logging disabled.`
-        : `${SYSTEM_MARK} Verbose logging enabled.`;
+
+    const parts: string[] = [];
+    if (hasThinkDirective && inlineThink) {
+      parts.push(
+        inlineThink === "off"
+          ? "Thinking disabled."
+          : `Thinking level set to ${inlineThink}.`,
+      );
+    }
+    if (hasVerboseDirective && inlineVerbose) {
+      parts.push(
+        inlineVerbose === "off"
+          ? `${SYSTEM_MARK} Verbose logging disabled.`
+          : `${SYSTEM_MARK} Verbose logging enabled.`,
+      );
+    }
+    if (modelSelection) {
+      const label = `${modelSelection.provider}/${modelSelection.model}`;
+      const labelWithAlias = modelSelection.alias
+        ? `${modelSelection.alias} (${label})`
+        : label;
+      parts.push(
+        modelSelection.isDefault
+          ? `Model reset to default (${labelWithAlias}).`
+          : `Model set to ${labelWithAlias}.`,
+      );
+    }
+    if (hasQueueDirective && inlineQueueMode) {
+      parts.push(`${SYSTEM_MARK} Queue mode set to ${inlineQueueMode}.`);
+    } else if (hasQueueDirective && inlineQueueReset) {
+      parts.push(`${SYSTEM_MARK} Queue mode reset to default.`);
+    }
+    const ack = parts.join(" ").trim();
     cleanupTyping();
-    return { text: ack };
+    return { text: ack || "OK." };
   }
 
-  // Persist inline think/verbose settings even when additional content follows.
+  // Persist inline think/verbose/model settings even when additional content follows.
   if (sessionEntry && sessionStore && sessionKey) {
     let updated = false;
     if (hasThinkDirective && inlineThink) {
@@ -477,15 +747,57 @@ export async function getReplyFromConfig(
       }
       updated = true;
     }
+    if (hasModelDirective && effectiveModelDirective) {
+      const resolved = resolveModelRefFromString({
+        raw: effectiveModelDirective,
+        defaultProvider,
+        aliasIndex,
+      });
+      if (resolved) {
+        const key = modelKey(resolved.ref.provider, resolved.ref.model);
+        if (allowedModelKeys.size === 0 || allowedModelKeys.has(key)) {
+          const isDefault =
+            resolved.ref.provider === defaultProvider &&
+            resolved.ref.model === defaultModel;
+          if (isDefault) {
+            delete sessionEntry.providerOverride;
+            delete sessionEntry.modelOverride;
+          } else {
+            sessionEntry.providerOverride = resolved.ref.provider;
+            sessionEntry.modelOverride = resolved.ref.model;
+          }
+          provider = resolved.ref.provider;
+          model = resolved.ref.model;
+          const nextLabel = `${provider}/${model}`;
+          if (nextLabel !== initialModelLabel) {
+            enqueueSystemEvent(
+              formatModelSwitchEvent(nextLabel, resolved.alias),
+              { contextKey: `model:${nextLabel}` },
+            );
+          }
+          contextTokens =
+            agentCfg?.contextTokens ??
+            lookupContextTokens(model) ??
+            DEFAULT_CONTEXT_TOKENS;
+          updated = true;
+        }
+      }
+    }
+    if (hasQueueDirective && inlineQueueReset) {
+      delete sessionEntry.queueMode;
+      updated = true;
+    }
     if (updated) {
       sessionEntry.updatedAt = Date.now();
       sessionStore[sessionKey] = sessionEntry;
       await saveSessionStore(storePath, sessionStore);
     }
   }
+  const perMessageQueueMode =
+    hasQueueDirective && !inlineQueueReset ? inlineQueueMode : undefined;
 
   // Optional allowlist by origin number (E.164 without whatsapp: prefix)
-  const configuredAllowFrom = cfg.inbound?.allowFrom;
+  const configuredAllowFrom = cfg.routing?.allowFrom;
   const from = (ctx.From ?? "").replace(/^whatsapp:/, "");
   const to = (ctx.To ?? "").replace(/^whatsapp:/, "");
   const isSamePhone = from && to && from === to;
@@ -500,6 +812,20 @@ export async function getReplyFromConfig(
       : defaultAllowFrom;
   const abortKey = sessionKey ?? (from || undefined) ?? (to || undefined);
   const rawBodyNormalized = triggerBodyNormalized;
+  const commandBodyNormalized = isGroup
+    ? stripMentions(rawBodyNormalized, ctx, cfg)
+    : rawBodyNormalized;
+  const activationCommand = parseActivationCommand(commandBodyNormalized);
+  const senderE164 = normalizeE164(ctx.SenderE164 ?? "");
+  const ownerCandidates = (allowFrom ?? []).filter(
+    (entry) => entry && entry !== "*",
+  );
+  if (ownerCandidates.length === 0 && to) ownerCandidates.push(to);
+  const ownerList = ownerCandidates
+    .map((entry) => normalizeE164(entry))
+    .filter((entry): entry is string => Boolean(entry));
+  const isOwnerSender =
+    Boolean(senderE164) && ownerList.includes(senderE164 ?? "");
 
   if (!sessionEntry && abortKey) {
     abortedLastRun = ABORT_MEMORY.get(abortKey) ?? false;
@@ -519,11 +845,47 @@ export async function getReplyFromConfig(
     }
   }
 
+  if (activationCommand.hasCommand) {
+    if (!isGroup) {
+      cleanupTyping();
+      return { text: "⚙️ Group activation only applies to group chats." };
+    }
+    if (!isOwnerSender) {
+      logVerbose(
+        `Ignoring /activation from non-owner in group: ${senderE164 || "<unknown>"}`,
+      );
+      cleanupTyping();
+      return undefined;
+    }
+    if (!activationCommand.mode) {
+      cleanupTyping();
+      return { text: "⚙️ Usage: /activation mention|always" };
+    }
+    if (sessionEntry && sessionStore && sessionKey) {
+      sessionEntry.groupActivation = activationCommand.mode;
+      sessionEntry.groupActivationNeedsSystemIntro = true;
+      sessionEntry.updatedAt = Date.now();
+      sessionStore[sessionKey] = sessionEntry;
+      await saveSessionStore(storePath, sessionStore);
+    }
+    cleanupTyping();
+    return {
+      text: `⚙️ Group activation set to ${activationCommand.mode}.`,
+    };
+  }
+
   if (
-    rawBodyNormalized === "/restart" ||
-    rawBodyNormalized === "restart" ||
-    rawBodyNormalized.startsWith("/restart ")
+    commandBodyNormalized === "/restart" ||
+    commandBodyNormalized === "restart" ||
+    commandBodyNormalized.startsWith("/restart ")
   ) {
+    if (isGroup && !isOwnerSender) {
+      logVerbose(
+        `Ignoring /restart from non-owner in group: ${senderE164 || "<unknown>"}`,
+      );
+      cleanupTyping();
+      return undefined;
+    }
     triggerClawdisRestart();
     cleanupTyping();
     return {
@@ -532,16 +894,22 @@ export async function getReplyFromConfig(
   }
 
   if (
-    rawBodyNormalized === "/status" ||
-    rawBodyNormalized === "status" ||
-    rawBodyNormalized.startsWith("/status ")
+    commandBodyNormalized === "/status" ||
+    commandBodyNormalized === "status" ||
+    commandBodyNormalized.startsWith("/status ")
   ) {
+    if (isGroup && !isOwnerSender) {
+      logVerbose(
+        `Ignoring /status from non-owner in group: ${senderE164 || "<unknown>"}`,
+      );
+      cleanupTyping();
+      return undefined;
+    }
     const webLinked = await webAuthExists();
     const webAuthAgeMs = getWebAuthAgeMs();
     const heartbeatSeconds = resolveHeartbeatSeconds(cfg, undefined);
     const statusText = buildStatusMessage({
       agent: {
-        provider,
         model,
         contextTokens,
         thinkingDefault: agentCfg?.thinkingDefault,
@@ -577,28 +945,57 @@ export async function getReplyFromConfig(
     return { text: "⚙️ Agent was aborted." };
   }
 
-  await startTypingLoop();
-
   const isFirstTurnInSession = isNewSession || !systemSent;
-  const groupIntro =
-    isFirstTurnInSession && sessionCtx.ChatType === "group"
-      ? (() => {
-          const subject = sessionCtx.GroupSubject?.trim();
-          const members = sessionCtx.GroupMembers?.trim();
-          const subjectLine = subject
-            ? `You are replying inside the WhatsApp group "${subject}".`
-            : "You are replying inside a WhatsApp group chat.";
-          const membersLine = members
-            ? `Group members: ${members}.`
+  const isGroupChat = sessionCtx.ChatType === "group";
+  const wasMentioned = ctx.WasMentioned === true;
+  const shouldEagerType = !isGroupChat || wasMentioned;
+  const shouldInjectGroupIntro =
+    isGroupChat &&
+    (isFirstTurnInSession || sessionEntry?.groupActivationNeedsSystemIntro);
+  const groupIntro = shouldInjectGroupIntro
+    ? (() => {
+        const activation =
+          normalizeGroupActivation(sessionEntry?.groupActivation) ??
+          defaultGroupActivation();
+        const subject = sessionCtx.GroupSubject?.trim();
+        const members = sessionCtx.GroupMembers?.trim();
+        const surface = sessionCtx.Surface?.trim().toLowerCase();
+        const surfaceLabel = (() => {
+          if (!surface) return "chat";
+          if (surface === "whatsapp") return "WhatsApp";
+          if (surface === "telegram") return "Telegram";
+          if (surface === "discord") return "Discord";
+          if (surface === "webchat") return "WebChat";
+          return `${surface.at(0)?.toUpperCase() ?? ""}${surface.slice(1)}`;
+        })();
+        const subjectLine = subject
+          ? `You are replying inside the ${surfaceLabel} group "${subject}".`
+          : `You are replying inside a ${surfaceLabel} group chat.`;
+        const membersLine = members ? `Group members: ${members}.` : undefined;
+        const activationLine =
+          activation === "always"
+            ? "Activation: always-on (you receive every group message)."
+            : "Activation: trigger-only (you are invoked only when explicitly mentioned; recent context may be included).";
+        const silenceLine =
+          activation === "always"
+            ? `If no response is needed, reply with exactly "${SILENT_REPLY_TOKEN}" (no other text) so Clawdis stays silent.`
             : undefined;
-          return [subjectLine, membersLine]
-            .filter(Boolean)
-            .join(" ")
-            .concat(
-              " Address the specific sender noted in the message context.",
-            );
-        })()
-      : "";
+        const cautionLine =
+          activation === "always"
+            ? "Be extremely selective: reply only when you are directly addressed, asked a question, or can add clear value. Otherwise stay silent."
+            : undefined;
+        return [
+          subjectLine,
+          membersLine,
+          activationLine,
+          silenceLine,
+          cautionLine,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .concat(" Address the specific sender noted in the message context.");
+      })()
+    : "";
   const baseBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
   const rawBodyTrimmed = (ctx.Body ?? "").trim();
   const baseBodyTrimmedRaw = baseBody.trim();
@@ -624,9 +1021,6 @@ export async function getReplyFromConfig(
     ? "Note: The previous agent run was aborted by the user. Resume carefully or ask for clarification."
     : "";
   let prefixedBodyBase = baseBodyFinal;
-  if (groupIntro) {
-    prefixedBodyBase = `${groupIntro}\n\n${prefixedBodyBase}`;
-  }
   if (abortedHint) {
     prefixedBodyBase = `${abortedHint}\n\n${prefixedBodyBase}`;
     if (sessionEntry && sessionStore && sessionKey) {
@@ -765,7 +1159,28 @@ export async function getReplyFromConfig(
         .trim()
     : queueBodyBase;
 
-  if (queueEmbeddedPiMessage(sessionIdFinal, queuedBody)) {
+  const resolvedQueueMode = resolveQueueMode({
+    cfg,
+    surface: sessionCtx.Surface,
+    sessionEntry,
+    inlineMode: perMessageQueueMode,
+  });
+  const sessionLaneKey = resolveEmbeddedSessionLane(
+    sessionKey ?? sessionIdFinal,
+  );
+  const laneSize = getQueueSize(sessionLaneKey);
+  if (resolvedQueueMode === "interrupt" && laneSize > 0) {
+    const cleared = clearCommandLane(sessionLaneKey);
+    const aborted = abortEmbeddedPiRun(sessionIdFinal);
+    logVerbose(
+      `Interrupting ${sessionLaneKey} (cleared ${cleared}, aborted=${aborted})`,
+    );
+  }
+
+  if (
+    resolvedQueueMode === "queue" &&
+    queueEmbeddedPiMessage(sessionIdFinal, queuedBody)
+  ) {
     if (sessionEntry && sessionStore && sessionKey) {
       sessionEntry.updatedAt = Date.now();
       sessionStore[sessionKey] = sessionEntry;
@@ -775,47 +1190,91 @@ export async function getReplyFromConfig(
     return undefined;
   }
 
-  await onReplyStart();
-
   try {
+    if (shouldEagerType) {
+      await startTypingLoop();
+    }
     const runId = crypto.randomUUID();
-    const runResult = await runEmbeddedPiAgent({
-      sessionId: sessionIdFinal,
-      sessionFile,
-      workspaceDir,
-      config: cfg,
-      skillsSnapshot,
-      prompt: commandBody,
-      provider,
-      model,
-      thinkLevel: resolvedThinkLevel,
-      verboseLevel: resolvedVerboseLevel,
-      timeoutMs,
-      runId,
-      onPartialReply: opts?.onPartialReply
-        ? (payload) =>
-            opts.onPartialReply?.({
-              text: payload.text,
-              mediaUrls: payload.mediaUrls,
-            })
-        : undefined,
-      shouldEmitToolResult,
-      onToolResult: opts?.onToolResult
-        ? (payload) =>
-            opts.onToolResult?.({
-              text: payload.text,
-              mediaUrls: payload.mediaUrls,
-            })
-        : undefined,
-    });
+    let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+    try {
+      runResult = await runEmbeddedPiAgent({
+        sessionId: sessionIdFinal,
+        sessionKey,
+        sessionFile,
+        workspaceDir,
+        config: cfg,
+        skillsSnapshot,
+        prompt: commandBody,
+        extraSystemPrompt: groupIntro || undefined,
+        ownerNumbers: ownerList.length > 0 ? ownerList : undefined,
+        enforceFinalTag: provider === "ollama" ? true : undefined,
+        provider,
+        model,
+        thinkLevel: resolvedThinkLevel,
+        verboseLevel: resolvedVerboseLevel,
+        timeoutMs,
+        runId,
+        onPartialReply: opts?.onPartialReply
+          ? async (payload) => {
+              await startTypingOnText(payload.text);
+              await opts.onPartialReply?.({
+                text: payload.text,
+                mediaUrls: payload.mediaUrls,
+              });
+            }
+          : undefined,
+        shouldEmitToolResult,
+        onToolResult: opts?.onToolResult
+          ? async (payload) => {
+              await startTypingOnText(payload.text);
+              await opts.onToolResult?.({
+                text: payload.text,
+                mediaUrls: payload.mediaUrls,
+              });
+            }
+          : undefined,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isContextOverflow =
+        /context.*overflow|too large|context window/i.test(message);
+      defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
+      return {
+        text: isContextOverflow
+          ? "⚠️ Context overflow - conversation too long. Starting fresh might help!"
+          : "⚠️ Agent failed. Check gateway logs.",
+      };
+    }
+
+    if (
+      shouldInjectGroupIntro &&
+      sessionEntry &&
+      sessionStore &&
+      sessionKey &&
+      sessionEntry.groupActivationNeedsSystemIntro
+    ) {
+      sessionEntry.groupActivationNeedsSystemIntro = false;
+      sessionEntry.updatedAt = Date.now();
+      sessionStore[sessionKey] = sessionEntry;
+      await saveSessionStore(storePath, sessionStore);
+    }
 
     const payloadArray = runResult.payloads ?? [];
     if (payloadArray.length === 0) return undefined;
+    const shouldSignalTyping = payloadArray.some((payload) => {
+      const trimmed = payload.text?.trim();
+      if (trimmed && trimmed !== SILENT_REPLY_TOKEN) return true;
+      if (payload.mediaUrl) return true;
+      if (payload.mediaUrls && payload.mediaUrls.length > 0) return true;
+      return false;
+    });
+    if (shouldSignalTyping) {
+      await startTypingLoop();
+    }
 
     if (sessionStore && sessionKey) {
       const usage = runResult.meta.agentMeta?.usage;
-      const modelUsed =
-        runResult.meta.agentMeta?.model ?? agentCfg?.model ?? DEFAULT_MODEL;
+      const modelUsed = runResult.meta.agentMeta?.model ?? defaultModel;
       const contextTokensUsed =
         agentCfg?.contextTokens ??
         lookupContextTokens(modelUsed) ??

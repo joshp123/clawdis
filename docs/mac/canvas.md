@@ -99,7 +99,7 @@ Use the main `clawdis` CLI; it invokes canvas commands via `node.invoke`.
 Canvas A2UI is hosted by the **Gateway canvas host** at:
 
 ```
-http(s)://<gateway-host>:18789/__clawdis__/a2ui/
+http://<gateway-host>:18793/__clawdis__/a2ui/
 ```
 
 The macOS app simply renders that page in the Canvas panel. The agent can drive it with JSONL **server→client protocol messages** (one JSON object per line):
@@ -123,6 +123,8 @@ clawdis canvas a2ui push --jsonl /tmp/a2ui-v0.8.jsonl --node <id>
 Notes:
 - This does **not** support the A2UI v0.9 examples using `createSurface`.
 - A2UI **fails** if the Gateway canvas host is unreachable (no local fallback).
+- `canvas a2ui push` validates JSONL (line numbers on errors) and rejects v0.9 payloads.
+- Quick smoke: `clawdis canvas a2ui push --text "Hello from A2UI"` renders a minimal v0.8 view.
 
 ## Triggering agent runs from Canvas (deep links)
 

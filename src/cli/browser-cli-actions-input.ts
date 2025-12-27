@@ -6,6 +6,7 @@ import {
   browserArmFileChooser,
   browserNavigate,
 } from "../browser/client-actions.js";
+import type { BrowserFormField } from "../browser/client-actions-core.js";
 import { danger } from "../globals.js";
 import { defaultRuntime } from "../runtime.js";
 import type { BrowserParentOpts } from "./browser-cli-shared.js";
@@ -18,14 +19,37 @@ async function readFile(path: string): Promise<string> {
 async function readFields(opts: {
   fields?: string;
   fieldsFile?: string;
-}): Promise<Array<Record<string, unknown>>> {
+}): Promise<BrowserFormField[]> {
   const payload = opts.fieldsFile
     ? await readFile(opts.fieldsFile)
     : (opts.fields ?? "");
   if (!payload.trim()) throw new Error("fields are required");
   const parsed = JSON.parse(payload) as unknown;
   if (!Array.isArray(parsed)) throw new Error("fields must be an array");
-  return parsed as Array<Record<string, unknown>>;
+  return parsed.map((entry, index) => {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`fields[${index}] must be an object`);
+    }
+    const rec = entry as Record<string, unknown>;
+    const ref = typeof rec.ref === "string" ? rec.ref.trim() : "";
+    const type = typeof rec.type === "string" ? rec.type.trim() : "";
+    if (!ref || !type) {
+      throw new Error(`fields[${index}] must include ref and type`);
+    }
+    if (
+      typeof rec.value === "string" ||
+      typeof rec.value === "number" ||
+      typeof rec.value === "boolean"
+    ) {
+      return { ref, type, value: rec.value };
+    }
+    if (rec.value === undefined || rec.value === null) {
+      return { ref, type };
+    }
+    throw new Error(
+      `fields[${index}].value must be string, number, boolean, or null`,
+    );
+  });
 }
 
 export function registerBrowserActionInputCommands(
@@ -90,15 +114,21 @@ export function registerBrowserActionInputCommands(
 
   browser
     .command("click")
-    .description("Click an element by ref from an ai snapshot (e.g. 76)")
+    .description("Click an element by ref from snapshot")
     .argument("<ref>", "Ref id from ai snapshot")
     .option("--target-id <id>", "CDP target id (or unique prefix)")
     .option("--double", "Double click", false)
     .option("--button <left|right|middle>", "Mouse button to use")
     .option("--modifiers <list>", "Comma-separated modifiers (Shift,Alt,Meta)")
-    .action(async (ref: string, opts, cmd) => {
+    .action(async (ref: string | undefined, opts, cmd) => {
       const parent = parentOpts(cmd);
       const baseUrl = resolveBrowserControlUrl(parent?.url);
+      const refValue = typeof ref === "string" ? ref.trim() : "";
+      if (!refValue) {
+        defaultRuntime.error(danger("ref is required"));
+        defaultRuntime.exit(1);
+        return;
+      }
       const modifiers = opts.modifiers
         ? String(opts.modifiers)
             .split(",")
@@ -108,7 +138,7 @@ export function registerBrowserActionInputCommands(
       try {
         const result = await browserAct(baseUrl, {
           kind: "click",
-          ref,
+          ref: refValue,
           targetId: opts.targetId?.trim() || undefined,
           doubleClick: Boolean(opts.double),
           button: opts.button?.trim() || undefined,
@@ -119,7 +149,7 @@ export function registerBrowserActionInputCommands(
           return;
         }
         const suffix = result.url ? ` on ${result.url}` : "";
-        defaultRuntime.log(`clicked ref ${ref}${suffix}`);
+        defaultRuntime.log(`clicked ref ${refValue}${suffix}`);
       } catch (err) {
         defaultRuntime.error(danger(String(err)));
         defaultRuntime.exit(1);
@@ -128,19 +158,25 @@ export function registerBrowserActionInputCommands(
 
   browser
     .command("type")
-    .description("Type into an element by ai ref")
+    .description("Type into an element by ref from snapshot")
     .argument("<ref>", "Ref id from ai snapshot")
     .argument("<text>", "Text to type")
     .option("--submit", "Press Enter after typing", false)
     .option("--slowly", "Type slowly (human-like)", false)
     .option("--target-id <id>", "CDP target id (or unique prefix)")
-    .action(async (ref: string, text: string, opts, cmd) => {
+    .action(async (ref: string | undefined, text: string, opts, cmd) => {
       const parent = parentOpts(cmd);
       const baseUrl = resolveBrowserControlUrl(parent?.url);
+      const refValue = typeof ref === "string" ? ref.trim() : "";
+      if (!refValue) {
+        defaultRuntime.error(danger("ref is required"));
+        defaultRuntime.exit(1);
+        return;
+      }
       try {
         const result = await browserAct(baseUrl, {
           kind: "type",
-          ref,
+          ref: refValue,
           text,
           submit: Boolean(opts.submit),
           slowly: Boolean(opts.slowly),
@@ -150,7 +186,7 @@ export function registerBrowserActionInputCommands(
           defaultRuntime.log(JSON.stringify(result, null, 2));
           return;
         }
-        defaultRuntime.log(`typed into ref ${ref}`);
+        defaultRuntime.log(`typed into ref ${refValue}`);
       } catch (err) {
         defaultRuntime.error(danger(String(err)));
         defaultRuntime.exit(1);

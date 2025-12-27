@@ -14,7 +14,7 @@ Last updated: 2025-12-13
 ## Context
 
 Clawdis already has:
-- A **periodic reply heartbeat** that runs the agent with `HEARTBEAT` and suppresses `HEARTBEAT_OK` (`src/web/auto-reply.ts`).
+- A **gateway heartbeat runner** that runs the agent with `HEARTBEAT` and suppresses `HEARTBEAT_OK` (`src/infra/heartbeat-runner.ts`).
 - A lightweight, in-memory **system event queue** (`enqueueSystemEvent`) that is injected into the next **main session** turn (`drainSystemEvents` in `src/auto-reply/reply.ts`).
 - A WebSocket **Gateway** daemon that is intended to be always-on (`docs/gateway.md`).
 
@@ -60,7 +60,8 @@ This RFC adds a small “cron job system” so Clawd can schedule future work an
 Each job is a JSON object with stable keys (unknown keys ignored for forward compatibility):
 
 - `id: string` (UUID)
-- `name?: string`
+- `name: string` (required)
+- `description?: string` (optional)
 - `enabled: boolean`
 - `createdAtMs: number`
 - `updatedAtMs: number`
@@ -196,12 +197,12 @@ This yields:
 We need a way for the Gateway (or the scheduler) to request an immediate heartbeat without duplicating heartbeat logic.
 
 Design:
-- `monitorWebProvider` owns the real `runReplyHeartbeat()` function (it already has all the local state needed).
-- Add a small global hook module:
-  - `setReplyHeartbeatWakeHandler(fn | null)` installed by `monitorWebProvider`
-  - `requestReplyHeartbeatNow({ reason, coalesceMs? })`
-- If the handler is absent (provider not connected), the request is stored as “pending”; the next time the handler is installed, it runs once.
-- Coalesce rapid calls and respect the existing “skip when queue busy” behavior (prefer retrying soon vs dropping).
+- `startHeartbeatRunner` owns the real heartbeat execution and installs a wake handler.
+- Wake hook lives in `src/infra/heartbeat-wake.ts`:
+  - `setHeartbeatWakeHandler(fn | null)` installed by the heartbeat runner
+  - `requestHeartbeatNow({ reason, coalesceMs? })`
+- If the handler is absent, the request is stored as “pending”; the next time the handler is installed, it runs once.
+- Coalesce rapid calls and respect the “skip when queue busy” behavior (retry soon vs dropping).
 
 ## Run history log (JSONL)
 
@@ -263,7 +264,7 @@ Add a `cron` command group (all commands should also support `--json` where sens
     - `--wake now|next-heartbeat`
   - payload flags (choose one):
     - `--system-event "<text>"`
-    - `--message "<agent message>" [--deliver] [--channel last|whatsapp|telegram] [--to <dest>]`
+    - `--message "<agent message>" [--deliver] [--channel last|whatsapp|telegram|discord] [--to <dest>]`
 
 - `clawdis cron edit <id> ...` (patch-by-flags, non-interactive)
 - `clawdis cron rm <id>`

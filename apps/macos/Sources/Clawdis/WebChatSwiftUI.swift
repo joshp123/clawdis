@@ -9,8 +9,9 @@ import SwiftUI
 private let webChatSwiftLogger = Logger(subsystem: "com.steipete.clawdis", category: "WebChatSwiftUI")
 
 private enum WebChatSwiftUILayout {
-    static let windowSize = NSSize(width: 1120, height: 840)
+    static let windowSize = NSSize(width: 500, height: 840)
     static let panelSize = NSSize(width: 480, height: 640)
+    static let windowMinSize = NSSize(width: 480, height: 360)
     static let anchorPadding: CGFloat = 8
 }
 
@@ -140,6 +141,7 @@ final class WebChatSwiftUIWindowController {
     private let presentation: WebChatPresentation
     private let sessionKey: String
     private let hosting: NSHostingController<ClawdisChatView>
+    private let contentController: NSViewController
     private var window: NSWindow?
     private var dismissMonitor: Any?
     var onClosed: (() -> Void)?
@@ -154,11 +156,8 @@ final class WebChatSwiftUIWindowController {
         self.presentation = presentation
         let vm = ClawdisChatViewModel(sessionKey: sessionKey, transport: transport)
         self.hosting = NSHostingController(rootView: ClawdisChatView(viewModel: vm))
-        self.hosting.view.wantsLayer = true
-        self.hosting.view.layer?.cornerCurve = .continuous
-        self.hosting.view.layer?.cornerRadius = 16
-        self.hosting.view.layer?.masksToBounds = true
-        self.window = Self.makeWindow(for: presentation, contentViewController: self.hosting)
+        self.contentController = Self.makeContentController(for: presentation, hosting: self.hosting)
+        self.window = Self.makeWindow(for: presentation, contentViewController: self.contentController)
     }
 
     deinit {}
@@ -169,6 +168,7 @@ final class WebChatSwiftUIWindowController {
 
     func show() {
         guard let window else { return }
+        self.ensureWindowSize()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.onVisibilityChanged?(true)
@@ -232,6 +232,7 @@ final class WebChatSwiftUIWindowController {
     }
 
     private func installDismissMonitor() {
+        if ProcessInfo.processInfo.isRunningTests { return }
         guard self.dismissMonitor == nil, self.window != nil else { return }
         self.dismissMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown])
@@ -262,16 +263,18 @@ final class WebChatSwiftUIWindowController {
                 styleMask: [.titled, .closable, .resizable, .miniaturizable],
                 backing: .buffered,
                 defer: false)
-            window.title = "Clawdis Chat (SwiftUI)"
+            window.title = "Clawdis Chat"
             window.contentViewController = contentViewController
             window.isReleasedWhenClosed = false
             window.titleVisibility = .visible
             window.titlebarAppearsTransparent = false
-            window.backgroundColor = .windowBackgroundColor
-            window.isOpaque = true
+            window.backgroundColor = .clear
+            window.isOpaque = false
             window.center()
             WindowPlacement.ensureOnScreen(window: window, defaultSize: WebChatSwiftUILayout.windowSize)
-            window.minSize = NSSize(width: 880, height: 680)
+            window.minSize = WebChatSwiftUILayout.windowMinSize
+            window.contentView?.wantsLayer = true
+            window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
             return window
         case .panel:
             let panel = WebChatPanel(
@@ -290,12 +293,66 @@ final class WebChatSwiftUIWindowController {
             panel.isOpaque = false
             panel.contentViewController = contentViewController
             panel.becomesKeyOnlyIfNeeded = true
+            panel.contentView?.wantsLayer = true
+            panel.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
             panel.setFrame(
                 WindowPlacement.topRightFrame(
                     size: WebChatSwiftUILayout.panelSize,
                     padding: WebChatSwiftUILayout.anchorPadding),
                 display: false)
             return panel
+        }
+    }
+
+    private static func makeContentController(
+        for presentation: WebChatPresentation,
+        hosting: NSHostingController<ClawdisChatView>) -> NSViewController
+    {
+        let controller = NSViewController()
+        let effectView = NSVisualEffectView()
+        effectView.material = .sidebar
+        effectView.blendingMode = .behindWindow
+        effectView.state = .active
+        effectView.wantsLayer = true
+        effectView.layer?.cornerCurve = .continuous
+        let cornerRadius: CGFloat = switch presentation {
+        case .panel:
+            16
+        case .window:
+            0
+        }
+        effectView.layer?.cornerRadius = cornerRadius
+        effectView.layer?.masksToBounds = true
+
+        effectView.translatesAutoresizingMaskIntoConstraints = true
+        effectView.autoresizingMask = [.width, .height]
+        let rootView = effectView
+
+        hosting.view.translatesAutoresizingMaskIntoConstraints = false
+        hosting.view.wantsLayer = true
+        hosting.view.layer?.backgroundColor = NSColor.clear.cgColor
+
+        controller.addChild(hosting)
+        effectView.addSubview(hosting.view)
+        controller.view = rootView
+
+        NSLayoutConstraint.activate([
+            hosting.view.leadingAnchor.constraint(equalTo: effectView.leadingAnchor),
+            hosting.view.trailingAnchor.constraint(equalTo: effectView.trailingAnchor),
+            hosting.view.topAnchor.constraint(equalTo: effectView.topAnchor),
+            hosting.view.bottomAnchor.constraint(equalTo: effectView.bottomAnchor),
+        ])
+
+        return controller
+    }
+
+    private func ensureWindowSize() {
+        guard case .window = self.presentation, let window else { return }
+        let current = window.frame.size
+        let min = WebChatSwiftUILayout.windowMinSize
+        if current.width < min.width || current.height < min.height {
+            let frame = WindowPlacement.centeredFrame(size: WebChatSwiftUILayout.windowSize)
+            window.setFrame(frame, display: false)
         }
     }
 }

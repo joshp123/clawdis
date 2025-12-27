@@ -3,6 +3,9 @@ export type MsgContext = {
   From?: string;
   To?: string;
   MessageSid?: string;
+  ReplyToId?: string;
+  ReplyToBody?: string;
+  ReplyToSender?: string;
   MediaPath?: string;
   MediaUrl?: string;
   MediaType?: string;
@@ -13,6 +16,7 @@ export type MsgContext = {
   SenderName?: string;
   SenderE164?: string;
   Surface?: string;
+  WasMentioned?: boolean;
 };
 
 export type TemplateContext = MsgContext & {
@@ -25,7 +29,7 @@ export type TemplateContext = MsgContext & {
 export function applyTemplate(str: string | undefined, ctx: TemplateContext) {
   if (!str) return "";
   return str.replace(/{{\s*(\w+)\s*}}/g, (_, key) => {
-    const value = (ctx as Record<string, unknown>)[key];
+    const value = ctx[key as keyof TemplateContext];
     return value == null ? "" : String(value);
   });
 }

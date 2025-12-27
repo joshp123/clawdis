@@ -30,11 +30,11 @@ cp docs/templates/TOOLS.md ~/.clawdis/workspace/TOOLS.md
 cp docs/AGENTS.default.md ~/.clawdis/workspace/AGENTS.md
 ```
 
-4) Optional: choose a different workspace by setting `inbound.workspace` (supports `~`):
+4) Optional: choose a different workspace by setting `agent.workspace` (supports `~`):
 
 ```json5
 {
-  inbound: {
+  agent: {
     workspace: "~/clawd"
   }
 }
@@ -45,10 +45,29 @@ cp docs/AGENTS.default.md ~/.clawdis/workspace/AGENTS.md
 - Don’t run destructive commands unless explicitly asked.
 - Don’t send partial/streaming replies to external messaging surfaces (only final replies).
 
-## Daily memory (recommended)
-- Keep a short daily log at `memory/YYYY-MM-DD.md` (create `memory/` if needed).
-- On session start, read today + yesterday if present.
-- Capture durable facts, preferences, and decisions; avoid secrets.
+## Session start (required)
+- Read `SOUL.md`, `USER.md`, `memory.md`, and today+yesterday in `memory/`.
+- Do it before responding.
+
+## Soul (required)
+- `SOUL.md` defines identity, tone, and boundaries. Keep it current.
+- If you change `SOUL.md`, tell the user.
+- You are a fresh instance each session; continuity lives in these files.
+
+## Shared spaces (recommended)
+- You’re not the user’s voice; be careful in group chats or public channels.
+- Don’t share private data, contact info, or internal notes.
+
+## Memory system (recommended)
+- Daily log: `memory/YYYY-MM-DD.md` (create `memory/` if needed).
+- Long-term memory: `memory.md` for durable facts, preferences, and decisions.
+- On session start, read today + yesterday + `memory.md` if present.
+- Capture: decisions, preferences, constraints, open loops.
+- Avoid secrets unless explicitly requested.
+
+## Tools & skills
+- Tools live in skills; follow each skill’s `SKILL.md` when you need it.
+- Keep environment-specific notes in `TOOLS.md` (Notes for Skills).
 
 ## Backup tip (recommended)
 If you treat this workspace as Clawd’s “memory”, make it a git repo (ideally private) so `AGENTS.md` and your memory files are backed up.
@@ -90,6 +109,7 @@ git commit -m "Add Clawd workspace"
 - Prefer the `clawdis` CLI for scripting; mac app handles permissions.
 - Run installs from the Skills tab; it hides the button if a binary is already present.
 - Keep heartbeats enabled so the assistant can schedule reminders, monitor inboxes, and trigger camera captures.
+- Canvas UI runs full-screen with native overlays. Avoid placing critical controls in the top-left/top-right/bottom edges; add explicit gutters in the layout and don’t rely on safe-area insets.
 - For browser-driven verification, use `clawdis browser` (tabs/status/screenshot) with the clawd-managed Chrome profile.
 - For DOM inspection, use `clawdis browser eval|query|dom|snapshot` (and `--json`/`--out` when you need machine output).
-- For interactions, use `clawdis browser click|type|hover|drag|select|upload|press|wait|navigate|back|evaluate|run`.
+- For interactions, use `clawdis browser click|type|hover|drag|select|upload|press|wait|navigate|back|evaluate|run` (click/type require snapshot refs; use `evaluate` for CSS selectors).

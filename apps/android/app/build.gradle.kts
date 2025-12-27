@@ -20,7 +20,7 @@ android {
     minSdk = 31
     targetSdk = 36
     versionCode = 1
-    versionName = "0.1"
+    versionName = "2.0.0-beta3"
   }
 
   buildTypes {
@@ -31,6 +31,7 @@ android {
 
   buildFeatures {
     compose = true
+    buildConfig = true
   }
 
   compileOptions {
@@ -38,14 +39,20 @@ android {
     targetCompatibility = JavaVersion.VERSION_17
   }
 
-  kotlinOptions {
-    jvmTarget = "17"
-  }
-
   packaging {
     resources {
       excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
+  }
+
+  lint {
+    disable += setOf("IconLauncherShape")
+  }
+}
+
+kotlin {
+  compilerOptions {
+    jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
   }
 }
 
@@ -56,7 +63,7 @@ dependencies {
 
   implementation("androidx.core:core-ktx:1.17.0")
   implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
-  implementation("androidx.activity:activity-compose:1.12.1")
+  implementation("androidx.activity:activity-compose:1.12.2")
 
   implementation("androidx.compose.ui:ui")
   implementation("androidx.compose.ui:ui-tooling-preview")

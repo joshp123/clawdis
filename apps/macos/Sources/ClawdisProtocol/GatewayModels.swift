@@ -514,6 +514,23 @@ public struct NodePairVerifyParams: Codable {
     }
 }
 
+public struct NodeRenameParams: Codable {
+    public let nodeid: String
+    public let displayname: String
+
+    public init(
+        nodeid: String,
+        displayname: String
+    ) {
+        self.nodeid = nodeid
+        self.displayname = displayname
+    }
+    private enum CodingKeys: String, CodingKey {
+        case nodeid = "nodeId"
+        case displayname = "displayName"
+    }
+}
+
 public struct NodeListParams: Codable {
 }
 
@@ -588,20 +605,71 @@ public struct SessionsPatchParams: Codable {
     public let key: String
     public let thinkinglevel: AnyCodable?
     public let verboselevel: AnyCodable?
+    public let groupactivation: AnyCodable?
 
     public init(
         key: String,
         thinkinglevel: AnyCodable?,
-        verboselevel: AnyCodable?
+        verboselevel: AnyCodable?,
+        groupactivation: AnyCodable?
     ) {
         self.key = key
         self.thinkinglevel = thinkinglevel
         self.verboselevel = verboselevel
+        self.groupactivation = groupactivation
     }
     private enum CodingKeys: String, CodingKey {
         case key
         case thinkinglevel = "thinkingLevel"
         case verboselevel = "verboseLevel"
+        case groupactivation = "groupActivation"
+    }
+}
+
+public struct SessionsResetParams: Codable {
+    public let key: String
+
+    public init(
+        key: String
+    ) {
+        self.key = key
+    }
+    private enum CodingKeys: String, CodingKey {
+        case key
+    }
+}
+
+public struct SessionsDeleteParams: Codable {
+    public let key: String
+    public let deletetranscript: Bool?
+
+    public init(
+        key: String,
+        deletetranscript: Bool?
+    ) {
+        self.key = key
+        self.deletetranscript = deletetranscript
+    }
+    private enum CodingKeys: String, CodingKey {
+        case key
+        case deletetranscript = "deleteTranscript"
+    }
+}
+
+public struct SessionsCompactParams: Codable {
+    public let key: String
+    public let maxlines: Int?
+
+    public init(
+        key: String,
+        maxlines: Int?
+    ) {
+        self.key = key
+        self.maxlines = maxlines
+    }
+    private enum CodingKeys: String, CodingKey {
+        case key
+        case maxlines = "maxLines"
     }
 }
 
@@ -618,6 +686,98 @@ public struct ConfigSetParams: Codable {
     }
     private enum CodingKeys: String, CodingKey {
         case raw
+    }
+}
+
+public struct ProvidersStatusParams: Codable {
+    public let probe: Bool?
+    public let timeoutms: Int?
+
+    public init(
+        probe: Bool?,
+        timeoutms: Int?
+    ) {
+        self.probe = probe
+        self.timeoutms = timeoutms
+    }
+    private enum CodingKeys: String, CodingKey {
+        case probe
+        case timeoutms = "timeoutMs"
+    }
+}
+
+public struct WebLoginStartParams: Codable {
+    public let force: Bool?
+    public let timeoutms: Int?
+    public let verbose: Bool?
+
+    public init(
+        force: Bool?,
+        timeoutms: Int?,
+        verbose: Bool?
+    ) {
+        self.force = force
+        self.timeoutms = timeoutms
+        self.verbose = verbose
+    }
+    private enum CodingKeys: String, CodingKey {
+        case force
+        case timeoutms = "timeoutMs"
+        case verbose
+    }
+}
+
+public struct WebLoginWaitParams: Codable {
+    public let timeoutms: Int?
+
+    public init(
+        timeoutms: Int?
+    ) {
+        self.timeoutms = timeoutms
+    }
+    private enum CodingKeys: String, CodingKey {
+        case timeoutms = "timeoutMs"
+    }
+}
+
+public struct ModelChoice: Codable {
+    public let id: String
+    public let name: String
+    public let provider: String
+    public let contextwindow: Int?
+
+    public init(
+        id: String,
+        name: String,
+        provider: String,
+        contextwindow: Int?
+    ) {
+        self.id = id
+        self.name = name
+        self.provider = provider
+        self.contextwindow = contextwindow
+    }
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case provider
+        case contextwindow = "contextWindow"
+    }
+}
+
+public struct ModelsListParams: Codable {
+}
+
+public struct ModelsListResult: Codable {
+    public let models: [ModelChoice]
+
+    public init(
+        models: [ModelChoice]
+    ) {
+        self.models = models
+    }
+    private enum CodingKeys: String, CodingKey {
+        case models
     }
 }
 
@@ -672,7 +832,8 @@ public struct SkillsUpdateParams: Codable {
 
 public struct CronJob: Codable {
     public let id: String
-    public let name: String?
+    public let name: String
+    public let description: String?
     public let enabled: Bool
     public let createdatms: Int
     public let updatedatms: Int
@@ -685,7 +846,8 @@ public struct CronJob: Codable {
 
     public init(
         id: String,
-        name: String?,
+        name: String,
+        description: String?,
         enabled: Bool,
         createdatms: Int,
         updatedatms: Int,
@@ -698,6 +860,7 @@ public struct CronJob: Codable {
     ) {
         self.id = id
         self.name = name
+        self.description = description
         self.enabled = enabled
         self.createdatms = createdatms
         self.updatedatms = updatedatms
@@ -711,6 +874,7 @@ public struct CronJob: Codable {
     private enum CodingKeys: String, CodingKey {
         case id
         case name
+        case description
         case enabled
         case createdatms = "createdAtMs"
         case updatedatms = "updatedAtMs"
@@ -740,7 +904,8 @@ public struct CronStatusParams: Codable {
 }
 
 public struct CronAddParams: Codable {
-    public let name: String?
+    public let name: String
+    public let description: String?
     public let enabled: Bool?
     public let schedule: AnyCodable
     public let sessiontarget: AnyCodable
@@ -749,7 +914,8 @@ public struct CronAddParams: Codable {
     public let isolation: [String: AnyCodable]?
 
     public init(
-        name: String?,
+        name: String,
+        description: String?,
         enabled: Bool?,
         schedule: AnyCodable,
         sessiontarget: AnyCodable,
@@ -758,6 +924,7 @@ public struct CronAddParams: Codable {
         isolation: [String: AnyCodable]?
     ) {
         self.name = name
+        self.description = description
         self.enabled = enabled
         self.schedule = schedule
         self.sessiontarget = sessiontarget
@@ -767,6 +934,7 @@ public struct CronAddParams: Codable {
     }
     private enum CodingKeys: String, CodingKey {
         case name
+        case description
         case enabled
         case schedule
         case sessiontarget = "sessionTarget"

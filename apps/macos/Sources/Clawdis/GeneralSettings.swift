@@ -17,6 +17,7 @@ struct GeneralSettings: View {
     @State private var remoteStatus: RemoteStatus = .idle
     @State private var showRemoteAdvanced = false
     private let isPreview = ProcessInfo.processInfo.isPreview
+    private var isNixMode: Bool { ProcessInfo.processInfo.isNixMode }
 
     var body: some View {
         ScrollView(.vertical) {
@@ -125,13 +126,21 @@ struct GeneralSettings: View {
             }
 
             if self.state.connectionMode == .local {
-                self.gatewayInstallerCard
+                // In Nix mode, gateway is managed declaratively - no install buttons.
+                if !self.isNixMode {
+                    self.gatewayInstallerCard
+                }
+                TailscaleIntegrationSection(
+                    connectionMode: self.state.connectionMode,
+                    isPaused: self.state.isPaused)
                 self.healthRow
             }
 
             if self.state.connectionMode == .remote {
                 self.remoteCard
             }
+
+            self.cliInstaller
         }
     }
 
@@ -197,15 +206,15 @@ struct GeneralSettings: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Control channel")
                     .font(.caption.weight(.semibold))
-                if !self.isControlStatusDuplicate {
-                    Text(self.controlStatusLine)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if let ping = ControlChannel.shared.lastPingMs {
-                    Text("Last ping: \(Int(ping)) ms")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                if !self.isControlStatusDuplicate || ControlChannel.shared.lastPingMs != nil {
+                    let status = self.isControlStatusDuplicate ? nil : self.controlStatusLine
+                    let ping = ControlChannel.shared.lastPingMs.map { "Ping \(Int($0)) ms" }
+                    let line = [status, ping].compactMap(\.self).joined(separator: " · ")
+                    if !line.isEmpty {
+                        Text(line)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 if let hb = HeartbeatStore.shared.lastEvent {
                     let ageText = age(from: Date(timeIntervalSince1970: hb.ts / 1000))
@@ -526,7 +535,7 @@ extension GeneralSettings {
             timeout: 8)
 
         guard sshResult.ok else {
-            self.remoteStatus = .failed(self.formatSSHFailure(sshResult))
+            self.remoteStatus = .failed(self.formatSSHFailure(sshResult, target: settings.target))
             return
         }
 
@@ -558,7 +567,13 @@ extension GeneralSettings {
     }
 
     private static func sshCheckCommand(target: String, identity: String) -> [String] {
-        var args: [String] = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+        var args: [String] = [
+            "/usr/bin/ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UpdateHostKeys=yes",
+        ]
         if !identity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             args.append(contentsOf: ["-i", identity])
         }
@@ -567,12 +582,19 @@ extension GeneralSettings {
         return args
     }
 
-    private func formatSSHFailure(_ response: Response) -> String {
+    private func formatSSHFailure(_ response: Response, target: String) -> String {
         let payload = response.payload.flatMap { String(data: $0, encoding: .utf8) }
         let trimmed = payload?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .split(whereSeparator: \.isNewline)
             .joined(separator: " ")
+        if let trimmed,
+           trimmed.localizedCaseInsensitiveContains("host key verification failed")
+        {
+            let host = CommandResolver.parseSSHTarget(target)?.host ?? target
+            return "SSH check failed: Host key verification failed. Remove the old key with " +
+                "`ssh-keygen -R \(host)` and try again."
+        }
         if let trimmed, !trimmed.isEmpty {
             if let message = response.message, message.hasPrefix("exit ") {
                 return "SSH check failed: \(trimmed) (\(message))"
@@ -612,11 +634,10 @@ extension GeneralSettings {
         let host = gateway.tailnetDns ?? gateway.lanHost
         guard let host else { return }
         let user = NSUserName()
-        var target = "\(user)@\(host)"
-        if gateway.sshPort != 22 {
-            target += ":\(gateway.sshPort)"
-        }
-        self.state.remoteTarget = target
+        self.state.remoteTarget = GatewayDiscoveryModel.buildSSHTarget(
+            user: user,
+            host: host,
+            port: gateway.sshPort)
         self.state.remoteCliPath = gateway.cliPath ?? ""
     }
 }
@@ -631,6 +652,45 @@ struct GeneralSettings_Previews: PreviewProvider {
     static var previews: some View {
         GeneralSettings(state: .preview)
             .frame(width: SettingsTab.windowWidth, height: SettingsTab.windowHeight)
+            .environment(TailscaleService.shared)
+    }
+}
+
+@MainActor
+extension GeneralSettings {
+    static func exerciseForTesting() {
+        let state = AppState(preview: true)
+        state.connectionMode = .remote
+        state.remoteTarget = "user@host:2222"
+        state.remoteIdentity = "/tmp/id_ed25519"
+        state.remoteProjectRoot = "/tmp/clawdis"
+        state.remoteCliPath = "/tmp/clawdis"
+
+        let view = GeneralSettings(state: state)
+        view.gatewayStatus = GatewayEnvironmentStatus(
+            kind: .ok,
+            nodeVersion: "1.0.0",
+            gatewayVersion: "1.0.0",
+            requiredGateway: nil,
+            message: "Gateway ready")
+        view.remoteStatus = .failed("SSH failed")
+        view.showRemoteAdvanced = true
+        view.cliInstalled = true
+        view.cliInstallLocation = "/usr/local/bin/clawdis"
+        view.cliStatus = "Installed"
+        _ = view.body
+
+        state.connectionMode = .unconfigured
+        _ = view.body
+
+        state.connectionMode = .local
+        view.gatewayStatus = GatewayEnvironmentStatus(
+            kind: .error("Gateway offline"),
+            nodeVersion: nil,
+            gatewayVersion: nil,
+            requiredGateway: nil,
+            message: "Gateway offline")
+        _ = view.body
     }
 }
 #endif

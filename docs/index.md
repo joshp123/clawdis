@@ -13,7 +13,7 @@ read_when:
 </p>
 
 <p align="center">
-  <strong>WhatsApp + Telegram gateway for AI agents (Pi).</strong><br>
+  <strong>WhatsApp + Telegram + Discord gateway for AI agents (Pi).</strong><br>
   Send a message, get an agent response — from your pocket.
 </p>
 
@@ -23,19 +23,19 @@ read_when:
   <a href="./clawd">Clawd setup</a>
 </p>
 
-CLAWDIS bridges WhatsApp (via WhatsApp Web / Baileys) and Telegram (Bot API / grammY) to coding agents like [Pi](https://github.com/badlogic/pi-mono).
+CLAWDIS bridges WhatsApp (via WhatsApp Web / Baileys), Telegram (Bot API / grammY), and Discord (Bot API / discord.js) to coding agents like [Pi](https://github.com/badlogic/pi-mono).
 It’s built for [Clawd](https://clawd.me), a space lobster who needed a TARDIS.
 
 ## How it works
 
 ```
-WhatsApp / Telegram
+WhatsApp / Telegram / Discord
         │
         ▼
   ┌──────────────────────────┐
   │          Gateway          │  ws://127.0.0.1:18789 (loopback-only)
   │     (single source)       │  tcp://0.0.0.0:18790 (Bridge)
-  │                          │  http://<gateway-host>:18789/__clawdis__/canvas/ (Canvas host)
+  │                          │  http://<gateway-host>:18793/__clawdis__/canvas/ (Canvas host)
   └───────────┬───────────────┘
               │
               ├─ Pi agent (RPC)
@@ -53,16 +53,17 @@ Most operations flow through the **Gateway** (`clawdis gateway`), a single long-
 - **Loopback-first**: Gateway WS defaults to `ws://127.0.0.1:18789`.
   - For Tailnet access, run `clawdis gateway --bind tailnet --token ...` (token is required for non-loopback binds).
 - **Bridge for nodes**: optional LAN/tailnet-facing bridge on `tcp://0.0.0.0:18790` for paired nodes (Bonjour-discoverable).
-- **Canvas host**: HTTP file server on the Gateway port, serving `/__clawdis__/canvas/` for node WebViews; see `docs/configuration.md` (`canvasHost`).
+- **Canvas host**: HTTP file server on `canvasHost.port` (default `18793`), serving `/__clawdis__/canvas/` for node WebViews; see `docs/configuration.md` (`canvasHost`).
 - **Remote use**: SSH tunnel or tailnet/VPN; see `docs/remote.md` and `docs/discovery.md`.
 
 ## Features (high level)
 
 - 📱 **WhatsApp Integration** — Uses Baileys for WhatsApp Web protocol
 - ✈️ **Telegram Bot** — DMs + groups via grammY
+- 🎮 **Discord Bot** — DMs + guild channels via discord.js
 - 🤖 **Agent bridge** — Pi (RPC mode) with tool streaming
 - 💬 **Sessions** — Direct chats collapse into shared `main` (default); groups are isolated
-- 👥 **Group Chat Support** — Mention-based triggering in group chats
+- 👥 **Group Chat Support** — Mention-based by default; owner can toggle `/activation always|mention`
 - 📎 **Media Support** — Send and receive images, audio, documents
 - 🎤 **Voice notes** — Optional transcription hook
 - 🖥️ **WebChat + macOS app** — Local UI + menu bar companion for ops and voice wake
@@ -98,13 +99,13 @@ clawdis send --to +15555550123 --message "Hello from CLAWDIS"
 Config lives at `~/.clawdis/clawdis.json`.
 
 - If you **do nothing**, CLAWDIS uses the bundled Pi binary in RPC mode with per-sender sessions.
-- If you want to lock it down, start with `inbound.allowFrom` and (for groups) mention rules.
+- If you want to lock it down, start with `routing.allowFrom` and (for groups) mention rules.
 
 Example:
 
 ```json5
 {
-  inbound: {
+  routing: {
     allowFrom: ["+15555550123"],
     groupChat: { requireMention: true, mentionPatterns: ["@clawd"] }
   }
@@ -115,6 +116,7 @@ Example:
 
 - Start here:
   - [Configuration](./configuration.md)
+  - [Nix mode](./nix.md)
   - [Clawd personal assistant setup](./clawd.md)
   - [Skills](./skills.md)
   - [Workspace templates](./templates/AGENTS.md)
@@ -127,6 +129,7 @@ Example:
   - [WebChat](./webchat.md)
   - [Control UI (browser)](./control-ui.md)
   - [Telegram](./telegram.md)
+  - [Discord](./discord.md)
   - [Group messages](./group-messages.md)
   - [Media: images](./images.md)
   - [Media: audio](./audio.md)

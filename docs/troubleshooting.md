@@ -22,15 +22,15 @@ The agent was interrupted mid-response.
 
 ### Messages Not Triggering
 
-**Check 1:** Is the sender in `allowFrom`?
+**Check 1:** Is the sender in `routing.allowFrom`?
 ```bash
-cat ~/.clawdis/clawdis.json | jq '.inbound.allowFrom'
+cat ~/.clawdis/clawdis.json | jq '.routing.allowFrom'
 ```
 
 **Check 2:** For group chats, is mention required?
 ```bash
 # The message must contain a pattern from mentionPatterns
-cat ~/.clawdis/clawdis.json | jq '.inbound.groupChat'
+cat ~/.clawdis/clawdis.json | jq '.routing.groupChat'
 ```
 
 **Check 3:** Check the logs
@@ -62,7 +62,7 @@ ls -la ~/.clawdis/sessions/
 }
 ```
 
-**Check 3:** Did someone send `/new` or a reset trigger?
+**Check 3:** Did someone send `/new`, `/reset`, or a reset trigger?
 
 ### Agent Timing Out
 
@@ -83,7 +83,7 @@ Or use the `process` tool to background long commands.
 ```bash
 # Check local status (creds, sessions, queued events)
 clawdis status
-# Probe the running gateway + providers (WA connect + Telegram API)
+# Probe the running gateway + providers (WA connect + Telegram + Discord APIs)
 clawdis status --deep
 
 # View recent connection events

@@ -11,6 +11,12 @@ final class CanvasManager {
 
     private var panelController: CanvasWindowController?
     private var panelSessionKey: String?
+    private var lastAutoA2UIUrl: String?
+    private var gatewayWatchTask: Task<Void, Never>?
+
+    private init() {
+        self.startGatewayObserver()
+    }
 
     var onPanelVisibilityChanged: ((Bool) -> Void)?
 
@@ -50,6 +56,7 @@ final class CanvasManager {
             }
             controller.presentAnchoredPanel(anchorProvider: anchorProvider)
             controller.applyPreferredPlacement(placement)
+            self.refreshDebugStatus()
 
             // Existing session: only navigate when an explicit target was provided.
             if let normalizedTarget {
@@ -60,6 +67,7 @@ final class CanvasManager {
                     effectiveTarget: normalizedTarget)
             }
 
+            self.maybeAutoNavigateToA2UIAsync(controller: controller)
             return CanvasShowResult(
                 directory: controller.directoryPath,
                 target: target,
@@ -93,6 +101,10 @@ final class CanvasManager {
         Self.logger.debug("showDetailed showCanvas effectiveTarget=\(effectiveTarget, privacy: .public)")
         controller.showCanvas(path: effectiveTarget)
         Self.logger.debug("showDetailed showCanvas done")
+        if normalizedTarget == nil {
+            self.maybeAutoNavigateToA2UIAsync(controller: controller)
+        }
+        self.refreshDebugStatus()
 
         return self.makeShowResult(
             directory: controller.directoryPath,
@@ -122,6 +134,63 @@ final class CanvasManager {
             throw NSError(domain: "Canvas", code: 21, userInfo: [NSLocalizedDescriptionKey: "canvas not available"])
         }
         return try await controller.snapshot(to: outPath)
+    }
+
+    // MARK: - Gateway A2UI auto-nav
+
+    private func startGatewayObserver() {
+        self.gatewayWatchTask?.cancel()
+        self.gatewayWatchTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await GatewayConnection.shared.subscribe(bufferingNewest: 1)
+            for await push in stream {
+                self.handleGatewayPush(push)
+            }
+        }
+    }
+
+    private func handleGatewayPush(_ push: GatewayPush) {
+        guard case let .snapshot(snapshot) = push else { return }
+        let a2uiUrl = Self.resolveA2UIHostUrl(from: snapshot.canvashosturl)
+        guard let controller = self.panelController else { return }
+        self.maybeAutoNavigateToA2UI(controller: controller, a2uiUrl: a2uiUrl)
+    }
+
+    private func maybeAutoNavigateToA2UIAsync(controller: CanvasWindowController) {
+        Task { [weak self] in
+            guard let self else { return }
+            let a2uiUrl = await self.resolveA2UIHostUrl()
+            await MainActor.run {
+                guard self.panelController === controller else { return }
+                self.maybeAutoNavigateToA2UI(controller: controller, a2uiUrl: a2uiUrl)
+            }
+        }
+    }
+
+    private func maybeAutoNavigateToA2UI(controller: CanvasWindowController, a2uiUrl: String?) {
+        guard let a2uiUrl else { return }
+        guard controller.shouldAutoNavigateToA2UI(lastAutoTarget: self.lastAutoA2UIUrl) else { return }
+        controller.load(target: a2uiUrl)
+        self.lastAutoA2UIUrl = a2uiUrl
+    }
+
+    private func resolveA2UIHostUrl() async -> String? {
+        let raw = await GatewayConnection.shared.canvasHostUrl()
+        return Self.resolveA2UIHostUrl(from: raw)
+    }
+
+    func refreshDebugStatus() {
+        guard let controller = self.panelController else { return }
+        let enabled = AppStateStore.shared.debugPaneEnabled
+        let title = GatewayProcessManager.shared.status.label
+        let subtitle = AppStateStore.shared.connectionMode.rawValue
+        controller.updateDebugStatus(enabled: enabled, title: title, subtitle: subtitle)
+    }
+
+    private static func resolveA2UIHostUrl(from raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty, let base = URL(string: trimmed) else { return nil }
+        return base.appendingPathComponent("__clawdis__/a2ui/").absoluteString
     }
 
     // MARK: - Anchoring

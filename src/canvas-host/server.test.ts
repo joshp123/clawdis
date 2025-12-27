@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
+import { rawDataToString } from "../infra/ws.js";
 import { defaultRuntime } from "../runtime.js";
 import {
   CANVAS_HOST_PATH,
@@ -34,7 +35,9 @@ describe("canvas host", () => {
     });
 
     try {
-      const res = await fetch(`http://127.0.0.1:${server.port}/`);
+      const res = await fetch(
+        `http://127.0.0.1:${server.port}${CANVAS_HOST_PATH}/`,
+      );
       const html = await res.text();
       expect(res.status).toBe(200);
       expect(html).toContain("Interactive test page");
@@ -111,7 +114,9 @@ describe("canvas host", () => {
     });
 
     try {
-      const res = await fetch(`http://127.0.0.1:${server.port}/`);
+      const res = await fetch(
+        `http://127.0.0.1:${server.port}${CANVAS_HOST_PATH}/`,
+      );
       const html = await res.text();
       expect(res.status).toBe(200);
       expect(html).toContain("v1");
@@ -142,7 +147,7 @@ describe("canvas host", () => {
         );
         ws.on("message", (data) => {
           clearTimeout(timer);
-          resolve(String(data));
+          resolve(rawDataToString(data));
         });
       });
 

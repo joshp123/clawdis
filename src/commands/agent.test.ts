@@ -12,7 +12,10 @@ import {
 } from "vitest";
 
 vi.mock("../agents/pi-embedded.js", () => ({
+  abortEmbeddedPiRun: vi.fn().mockReturnValue(false),
   runEmbeddedPiAgent: vi.fn(),
+  resolveEmbeddedSessionLane: (key: string) =>
+    `session:${key.trim() || "main"}`,
 }));
 
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
@@ -46,15 +49,17 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
 function mockConfig(
   home: string,
   storePath: string,
-  inboundOverrides?: Partial<NonNullable<ClawdisConfig["inbound"]>>,
+  routingOverrides?: Partial<NonNullable<ClawdisConfig["routing"]>>,
+  agentOverrides?: Partial<NonNullable<ClawdisConfig["agent"]>>,
 ) {
   configSpy.mockReturnValue({
-    inbound: {
+    agent: {
+      model: "anthropic/claude-opus-4-5",
       workspace: path.join(home, "clawd"),
-      agent: { provider: "anthropic", model: "claude-opus-4-5" },
-      session: { store: storePath, mainKey: "main" },
-      ...inboundOverrides,
+      ...agentOverrides,
     },
+    session: { store: storePath, mainKey: "main" },
+    routing: routingOverrides ? { ...routingOverrides } : undefined,
   });
 }
 
@@ -137,6 +142,21 @@ describe("agentCommand", () => {
 
       const callArgs = vi.mocked(runEmbeddedPiAgent).mock.calls.at(-1)?.[0];
       expect(callArgs?.sessionId).toBe("session-123");
+    });
+  });
+
+  it("uses provider/model from agent.model", async () => {
+    await withTempHome(async (home) => {
+      const store = path.join(home, "sessions.json");
+      mockConfig(home, store, undefined, {
+        model: "openai/gpt-4.1-mini",
+      });
+
+      await agentCommand({ message: "hi", to: "+1555" }, runtime);
+
+      const callArgs = vi.mocked(runEmbeddedPiAgent).mock.calls.at(-1)?.[0];
+      expect(callArgs?.provider).toBe("openai");
+      expect(callArgs?.model).toBe("gpt-4.1-mini");
     });
   });
 

@@ -6,14 +6,22 @@ import type {
 import {
   DisconnectReason,
   downloadMediaMessage,
+  extractMessageContent,
+  getContentType,
   isJidGroup,
+  normalizeMessageContent,
 } from "@whiskeysockets/baileys";
 
 import { loadConfig } from "../config/config.js";
 import { isVerbose, logVerbose } from "../globals.js";
-import { getChildLogger } from "../logging.js";
+import { createSubsystemLogger, getChildLogger } from "../logging.js";
 import { saveMediaBuffer } from "../media/store.js";
-import { jidToE164, normalizeE164 } from "../utils.js";
+import {
+  isSelfChatMode,
+  jidToE164,
+  normalizeE164,
+  toWhatsappJid,
+} from "../utils.js";
 import {
   createWaSocket,
   getStatusCode,
@@ -39,6 +47,9 @@ export type WebInboundMessage = {
   senderJid?: string;
   senderE164?: string;
   senderName?: string;
+  replyToId?: string;
+  replyToBody?: string;
+  replyToSender?: string;
   groupSubject?: string;
   groupParticipants?: string[];
   mentionedJids?: string[];
@@ -50,6 +61,7 @@ export type WebInboundMessage = {
   mediaPath?: string;
   mediaType?: string;
   mediaUrl?: string;
+  wasMentioned?: boolean;
 };
 
 export async function monitorWebInbox(options: {
@@ -57,6 +69,9 @@ export async function monitorWebInbox(options: {
   onMessage: (msg: WebInboundMessage) => Promise<void>;
 }) {
   const inboundLogger = getChildLogger({ module: "web-inbound" });
+  const inboundConsoleLog = createSubsystemLogger(
+    "gateway/providers/whatsapp",
+  ).child("inbound");
   const sock = await createWaSocket(false, options.verbose);
   await waitForWaConnection(sock);
   let onCloseResolve: ((reason: WebListenerCloseReason) => void) | null = null;
@@ -103,9 +118,12 @@ export async function monitorWebInbox(options: {
     }
   };
 
-  sock.ev.on("messages.upsert", async (upsert) => {
+  const handleMessagesUpsert = async (upsert: {
+    type?: string;
+    messages?: Array<import("@whiskeysockets/baileys").WAMessage>;
+  }) => {
     if (upsert.type !== "notify") return;
-    for (const msg of upsert.messages) {
+    for (const msg of upsert.messages ?? []) {
       const id = msg.key?.id ?? undefined;
       // De-dupe on message id; Baileys can emit retries.
       if (id && seen.has(id)) continue;
@@ -116,22 +134,6 @@ export async function monitorWebInbox(options: {
       // Ignore status/broadcast traffic; we only care about direct chats.
       if (remoteJid.endsWith("@status") || remoteJid.endsWith("@broadcast"))
         continue;
-      if (id) {
-        const participant = msg.key?.participant;
-        try {
-          await sock.readMessages([
-            { remoteJid, id, participant, fromMe: false },
-          ]);
-          if (isVerbose()) {
-            const suffix = participant ? ` (participant ${participant})` : "";
-            logVerbose(
-              `Marked message ${id} as read for ${remoteJid}${suffix}`,
-            );
-          }
-        } catch (err) {
-          logVerbose(`Failed to mark message ${id} read: ${String(err)}`);
-        }
-      }
       const group = isJidGroup(remoteJid);
       const participantJid = msg.key?.participant ?? undefined;
       const senderE164 = participantJid ? jidToE164(participantJid) : null;
@@ -149,7 +151,7 @@ export async function monitorWebInbox(options: {
       // Filter unauthorized senders early to prevent wasted processing
       // and potential session corruption from Bad MAC errors
       const cfg = loadConfig();
-      const configuredAllowFrom = cfg.inbound?.allowFrom;
+      const configuredAllowFrom = cfg.routing?.allowFrom;
       // Without user config, default to self-only DM access so the owner can talk to themselves
       const defaultAllowFrom =
         (!configuredAllowFrom || configuredAllowFrom.length === 0) && selfE164
@@ -160,6 +162,7 @@ export async function monitorWebInbox(options: {
           ? configuredAllowFrom
           : defaultAllowFrom;
       const isSamePhone = from === selfE164;
+      const isSelfChat = isSelfChatMode(selfE164, configuredAllowFrom);
 
       const allowlistEnabled =
         !group && Array.isArray(allowFrom) && allowFrom.length > 0;
@@ -174,11 +177,34 @@ export async function monitorWebInbox(options: {
         }
       }
 
+      if (id && !isSelfChat) {
+        const participant = msg.key?.participant;
+        try {
+          await sock.readMessages([
+            { remoteJid, id, participant, fromMe: false },
+          ]);
+          if (isVerbose()) {
+            const suffix = participant ? ` (participant ${participant})` : "";
+            logVerbose(
+              `Marked message ${id} as read for ${remoteJid}${suffix}`,
+            );
+          }
+        } catch (err) {
+          logVerbose(`Failed to mark message ${id} read: ${String(err)}`);
+        }
+      } else if (id && isSelfChat && isVerbose()) {
+        // Self-chat mode: never auto-send read receipts (blue ticks) on behalf of the owner.
+        logVerbose(`Self-chat mode: skipping read receipt for ${id}`);
+      }
+
       let body = extractText(msg.message ?? undefined);
       if (!body) {
         body = extractMediaPlaceholder(msg.message ?? undefined);
         if (!body) continue;
       }
+      const replyContext = describeReplyContext(
+        msg.message as proto.IMessage | undefined,
+      );
       let mediaPath: string | undefined;
       let mediaType: string | undefined;
       try {
@@ -227,65 +253,106 @@ export async function monitorWebInbox(options: {
         "inbound message",
       );
       try {
-        await options.onMessage({
-          id,
-          from,
-          conversationId: from,
-          to: selfE164 ?? "me",
-          body,
-          pushName: senderName,
-          timestamp,
-          chatType: group ? "group" : "direct",
-          chatId: remoteJid,
-          senderJid: participantJid,
-          senderE164: senderE164 ?? undefined,
-          senderName,
-          groupSubject,
-          groupParticipants,
-          mentionedJids: mentionedJids ?? undefined,
-          selfJid,
-          selfE164,
-          sendComposing,
-          reply,
-          sendMedia,
-          mediaPath,
-          mediaType,
+        const task = Promise.resolve(
+          options.onMessage({
+            id,
+            from,
+            conversationId: from,
+            to: selfE164 ?? "me",
+            body,
+            pushName: senderName,
+            timestamp,
+            chatType: group ? "group" : "direct",
+            chatId: remoteJid,
+            senderJid: participantJid,
+            senderE164: senderE164 ?? undefined,
+            senderName,
+            replyToId: replyContext?.id,
+            replyToBody: replyContext?.body,
+            replyToSender: replyContext?.sender,
+            groupSubject,
+            groupParticipants,
+            mentionedJids: mentionedJids ?? undefined,
+            selfJid,
+            selfE164,
+            sendComposing,
+            reply,
+            sendMedia,
+            mediaPath,
+            mediaType,
+          }),
+        );
+        void task.catch((err) => {
+          inboundLogger.error(
+            { error: String(err) },
+            "failed handling inbound web message",
+          );
+          inboundConsoleLog.error(
+            `Failed handling inbound web message: ${String(err)}`,
+          );
         });
-      } catch (err) {
-        console.error("Failed handling inbound web message:", String(err));
-      }
-    }
-  });
-
-  sock.ev.on(
-    "connection.update",
-    (update: Partial<import("@whiskeysockets/baileys").ConnectionState>) => {
-      try {
-        if (update.connection === "close") {
-          const status = getStatusCode(update.lastDisconnect?.error);
-          onCloseResolve?.({
-            status,
-            isLoggedOut: status === DisconnectReason.loggedOut,
-            error: update.lastDisconnect?.error,
-          });
-        }
       } catch (err) {
         inboundLogger.error(
           { error: String(err) },
-          "connection.update handler error",
+          "failed handling inbound web message",
         );
+        inboundConsoleLog.error(
+          `Failed handling inbound web message: ${String(err)}`,
+        );
+      }
+    }
+  };
+  sock.ev.on("messages.upsert", handleMessagesUpsert);
+
+  const handleConnectionUpdate = (
+    update: Partial<import("@whiskeysockets/baileys").ConnectionState>,
+  ) => {
+    try {
+      if (update.connection === "close") {
+        const status = getStatusCode(update.lastDisconnect?.error);
         onCloseResolve?.({
-          status: undefined,
-          isLoggedOut: false,
-          error: err,
+          status,
+          isLoggedOut: status === DisconnectReason.loggedOut,
+          error: update.lastDisconnect?.error,
         });
       }
-    },
-  );
+    } catch (err) {
+      inboundLogger.error(
+        { error: String(err) },
+        "connection.update handler error",
+      );
+      onCloseResolve?.({
+        status: undefined,
+        isLoggedOut: false,
+        error: err,
+      });
+    }
+  };
+  sock.ev.on("connection.update", handleConnectionUpdate);
 
   return {
     close: async () => {
       try {
+        const ev = sock.ev as unknown as {
+          off?: (event: string, listener: (...args: unknown[]) => void) => void;
+          removeListener?: (
+            event: string,
+            listener: (...args: unknown[]) => void,
+          ) => void;
+        };
+        const messagesUpsertHandler = handleMessagesUpsert as unknown as (
+          ...args: unknown[]
+        ) => void;
+        const connectionUpdateHandler = handleConnectionUpdate as unknown as (
+          ...args: unknown[]
+        ) => void;
+        if (typeof ev.off === "function") {
+          ev.off("messages.upsert", messagesUpsertHandler);
+          ev.off("connection.update", connectionUpdateHandler);
+        } else if (typeof ev.removeListener === "function") {
+          ev.removeListener("messages.upsert", messagesUpsertHandler);
+          ev.removeListener("connection.update", connectionUpdateHandler);
+        }
         sock.ws?.close();
       } catch (err) {
         logVerbose(`Socket close failed: ${String(err)}`);
@@ -302,7 +369,7 @@ export async function monitorWebInbox(options: {
       mediaBuffer?: Buffer,
       mediaType?: string,
     ): Promise<{ messageId: string }> => {
-      const jid = `${to.replace(/^\+/, "")}@s.whatsapp.net`;
+      const jid = toWhatsappJid(to);
       let payload: AnyMessageContent;
       if (mediaBuffer && mediaType) {
         if (mediaType.startsWith("image/")) {
@@ -342,7 +409,7 @@ export async function monitorWebInbox(options: {
      * Used after IPC send to show more messages are coming.
      */
     sendComposingTo: async (to: string): Promise<void> => {
-      const jid = `${to.replace(/^\+/, "")}@s.whatsapp.net`;
+      const jid = toWhatsappJid(to);
       await sock.sendPresenceUpdate("composing", jid);
     },
   } as const;
@@ -351,17 +418,47 @@ export async function monitorWebInbox(options: {
 function unwrapMessage(
   message: proto.IMessage | undefined,
 ): proto.IMessage | undefined {
+  const normalized = normalizeMessageContent(
+    message as proto.IMessage | undefined,
+  );
+  return normalized as proto.IMessage | undefined;
+}
+
+function extractContextInfo(
+  message: proto.IMessage | undefined,
+): proto.IContextInfo | undefined {
   if (!message) return undefined;
-  if (message.ephemeralMessage?.message) {
-    return unwrapMessage(message.ephemeralMessage.message as proto.IMessage);
+  const contentType = getContentType(message);
+  const candidate = contentType
+    ? (message as Record<string, unknown>)[contentType]
+    : undefined;
+  const contextInfo =
+    candidate && typeof candidate === "object" && "contextInfo" in candidate
+      ? (candidate as { contextInfo?: proto.IContextInfo }).contextInfo
+      : undefined;
+  if (contextInfo) return contextInfo;
+  const fallback =
+    message.extendedTextMessage?.contextInfo ??
+    message.imageMessage?.contextInfo ??
+    message.videoMessage?.contextInfo ??
+    message.documentMessage?.contextInfo ??
+    message.audioMessage?.contextInfo ??
+    message.stickerMessage?.contextInfo ??
+    message.buttonsResponseMessage?.contextInfo ??
+    message.listResponseMessage?.contextInfo ??
+    message.templateButtonReplyMessage?.contextInfo ??
+    message.interactiveResponseMessage?.contextInfo ??
+    message.buttonsMessage?.contextInfo ??
+    message.listMessage?.contextInfo;
+  if (fallback) return fallback;
+  for (const value of Object.values(message)) {
+    if (!value || typeof value !== "object") continue;
+    if (!("contextInfo" in value)) continue;
+    const candidateContext = (value as { contextInfo?: proto.IContextInfo })
+      .contextInfo;
+    if (candidateContext) return candidateContext;
   }
-  if (message.viewOnceMessage?.message) {
-    return unwrapMessage(message.viewOnceMessage.message as proto.IMessage);
-  }
-  if (message.viewOnceMessageV2?.message) {
-    return unwrapMessage(message.viewOnceMessageV2.message as proto.IMessage);
-  }
-  return message;
+  return undefined;
 }
 
 function extractMentionedJids(
@@ -394,14 +491,27 @@ export function extractText(
 ): string | undefined {
   const message = unwrapMessage(rawMessage);
   if (!message) return undefined;
-  if (typeof message.conversation === "string" && message.conversation.trim()) {
-    return message.conversation.trim();
+  const extracted = extractMessageContent(message);
+  const candidates = [
+    message,
+    extracted && extracted !== message ? extracted : undefined,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (
+      typeof candidate.conversation === "string" &&
+      candidate.conversation.trim()
+    ) {
+      return candidate.conversation.trim();
+    }
+    const extended = candidate.extendedTextMessage?.text;
+    if (extended?.trim()) return extended.trim();
+    const caption =
+      candidate.imageMessage?.caption ??
+      candidate.videoMessage?.caption ??
+      candidate.documentMessage?.caption;
+    if (caption?.trim()) return caption.trim();
   }
-  const extended = message.extendedTextMessage?.text;
-  if (extended?.trim()) return extended.trim();
-  const caption =
-    message.imageMessage?.caption ?? message.videoMessage?.caption;
-  if (caption?.trim()) return caption.trim();
   return undefined;
 }
 
@@ -416,6 +526,40 @@ export function extractMediaPlaceholder(
   if (message.documentMessage) return "<media:document>";
   if (message.stickerMessage) return "<media:sticker>";
   return undefined;
+}
+
+function describeReplyContext(rawMessage: proto.IMessage | undefined): {
+  id?: string;
+  body: string;
+  sender: string;
+} | null {
+  const message = unwrapMessage(rawMessage);
+  if (!message) return null;
+  const contextInfo = extractContextInfo(message);
+  const quoted = normalizeMessageContent(
+    contextInfo?.quotedMessage as proto.IMessage | undefined,
+  ) as proto.IMessage | undefined;
+  if (!quoted) return null;
+  const body = extractText(quoted) ?? extractMediaPlaceholder(quoted);
+  if (!body) {
+    const quotedType = quoted ? getContentType(quoted) : undefined;
+    logVerbose(
+      `Quoted message missing extractable body${
+        quotedType ? ` (type ${quotedType})` : ""
+      }`,
+    );
+    return null;
+  }
+  const senderJid = contextInfo?.participant ?? undefined;
+  const senderE164 = senderJid
+    ? (jidToE164(senderJid) ?? senderJid)
+    : undefined;
+  const sender = senderE164 ?? "unknown sender";
+  return {
+    id: contextInfo?.stanzaId ? String(contextInfo.stanzaId) : undefined,
+    body,
+    sender,
+  };
 }
 
 async function downloadInboundMedia(

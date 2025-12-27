@@ -9,6 +9,7 @@ enum GatewayAgentChannel: String, Codable, CaseIterable, Sendable {
     case last
     case whatsapp
     case telegram
+    case discord
     case webchat
 
     init(raw: String?) {
@@ -47,6 +48,14 @@ actor GatewayConnection {
         case setHeartbeats = "set-heartbeats"
         case systemEvent = "system-event"
         case health
+        case providersStatus = "providers.status"
+        case configGet = "config.get"
+        case configSet = "config.set"
+        case webLoginStart = "web.login.start"
+        case webLoginWait = "web.login.wait"
+        case webLogout = "web.logout"
+        case telegramLogout = "telegram.logout"
+        case modelsList = "models.list"
         case chatHistory = "chat.history"
         case chatSend = "chat.send"
         case chatAbort = "chat.abort"
@@ -101,24 +110,61 @@ actor GatewayConnection {
         do {
             return try await client.request(method: method, params: params, timeoutMs: timeoutMs)
         } catch {
+            if error is GatewayResponseError || error is GatewayDecodingError {
+                throw error
+            }
+
             // Auto-recover in local mode by spawning/attaching a gateway and retrying a few times.
             // Canvas interactions should "just work" even if the local gateway isn't running yet.
-            let isLocal = await MainActor.run { AppStateStore.shared.connectionMode == .local }
-            guard isLocal else { throw error }
+            let mode = await MainActor.run { AppStateStore.shared.connectionMode }
+            switch mode {
+            case .local:
+                await MainActor.run { GatewayProcessManager.shared.setActive(true) }
 
-            await MainActor.run { GatewayProcessManager.shared.setActive(true) }
+                var lastError: Error = error
+                for delayMs in [150, 400, 900] {
+                    try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                    do {
+                        return try await client.request(method: method, params: params, timeoutMs: timeoutMs)
+                    } catch {
+                        lastError = error
+                    }
+                }
 
-            var lastError: Error = error
-            for delayMs in [150, 400, 900] {
-                try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                throw lastError
+            case .remote:
+                let nsError = error as NSError
+                guard nsError.domain == URLError.errorDomain else { throw error }
+
+                var lastError: Error = error
+                await RemoteTunnelManager.shared.stopAll()
                 do {
-                    return try await client.request(method: method, params: params, timeoutMs: timeoutMs)
+                    _ = try await GatewayEndpointStore.shared.ensureRemoteControlTunnel()
                 } catch {
                     lastError = error
                 }
-            }
 
-            throw lastError
+                for delayMs in [150, 400, 900] {
+                    try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                    do {
+                        let cfg = try await self.configProvider()
+                        await self.configure(url: cfg.url, token: cfg.token)
+                        guard let client = self.client else {
+                            throw NSError(
+                                domain: "Gateway",
+                                code: 0,
+                                userInfo: [NSLocalizedDescriptionKey: "gateway not configured"])
+                        }
+                        return try await client.request(method: method, params: params, timeoutMs: timeoutMs)
+                    } catch {
+                        lastError = error
+                    }
+                }
+
+                throw lastError
+            case .unconfigured:
+                throw error
+            }
         }
     }
 
@@ -242,15 +288,11 @@ actor GatewayConnection {
 extension GatewayConnection {
     struct ConfigGetSnapshot: Decodable, Sendable {
         struct SnapshotConfig: Decodable, Sendable {
-            struct Inbound: Decodable, Sendable {
-                struct Session: Decodable, Sendable {
-                    let mainKey: String?
-                }
-
-                let session: Session?
+            struct Session: Decodable, Sendable {
+                let mainKey: String?
             }
 
-            let inbound: Inbound?
+            let session: Session?
         }
 
         let config: SnapshotConfig?
@@ -258,7 +300,7 @@ extension GatewayConnection {
 
     static func mainSessionKey(fromConfigGetData data: Data) throws -> String {
         let snapshot = try JSONDecoder().decode(ConfigGetSnapshot.self, from: data)
-        let raw = snapshot.config?.inbound?.session?.mainKey
+        let raw = snapshot.config?.session?.mainKey
         let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "main" : trimmed
     }

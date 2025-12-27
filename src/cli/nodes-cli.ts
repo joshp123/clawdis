@@ -38,6 +38,7 @@ type NodesRpcOpts = {
   sound?: string;
   priority?: string;
   delivery?: string;
+  name?: string;
   facing?: string;
   format?: string;
   maxWidth?: string;
@@ -159,6 +160,22 @@ function formatPermissions(raw: unknown) {
     ([key, granted]) => `${key}=${granted ? "yes" : "no"}`,
   );
   return `[${parts.join(", ")}]`;
+}
+
+function unauthorizedHintForMessage(message: string): string | null {
+  const haystack = message.toLowerCase();
+  if (
+    haystack.includes("unauthorizedclient") ||
+    haystack.includes("bridge client is not authorized") ||
+    haystack.includes("unsigned bridge clients are not allowed")
+  ) {
+    return [
+      "peekaboo bridge rejected the client.",
+      "sign the peekaboo CLI (TeamID Y5PE65HELJ) or launch the host with",
+      "PEEKABOO_ALLOW_UNSIGNED_SOCKET_CLIENTS=1 for local dev.",
+    ].join(" ");
+  }
+  return null;
 }
 
 function normalizeNodeKey(value: string) {
@@ -464,6 +481,37 @@ export function registerNodesCli(program: Command) {
 
   nodesCallOpts(
     nodes
+      .command("rename")
+      .description("Rename a paired node (display name override)")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .requiredOption("--name <displayName>", "New display name")
+      .action(async (opts: NodesRpcOpts) => {
+        try {
+          const nodeId = await resolveNodeId(opts, String(opts.node ?? ""));
+          const name = String(opts.name ?? "").trim();
+          if (!nodeId || !name) {
+            defaultRuntime.error("--node and --name required");
+            defaultRuntime.exit(1);
+            return;
+          }
+          const result = await callGatewayCli("node.rename", opts, {
+            nodeId,
+            displayName: name,
+          });
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(result, null, 2));
+            return;
+          }
+          defaultRuntime.log(`node rename ok: ${nodeId} -> ${name}`);
+        } catch (err) {
+          defaultRuntime.error(`nodes rename failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  nodesCallOpts(
+    nodes
       .command("invoke")
       .description("Invoke a command on a paired node")
       .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
@@ -602,6 +650,10 @@ export function registerNodesCli(program: Command) {
             defaultRuntime.exit(1);
             return;
           }
+          if (exitCode !== null && exitCode !== 0) {
+            const hint = unauthorizedHintForMessage(`${stderr}\n${stdout}`);
+            if (hint) defaultRuntime.error(hint);
+          }
           if (exitCode !== null && exitCode !== 0 && !success) {
             defaultRuntime.error(`run exit ${exitCode}`);
             defaultRuntime.exit(1);
@@ -609,6 +661,8 @@ export function registerNodesCli(program: Command) {
           }
         } catch (err) {
           defaultRuntime.error(`nodes run failed: ${String(err)}`);
+          const hint = unauthorizedHintForMessage(String(err));
+          if (hint) defaultRuntime.error(hint);
           defaultRuntime.exit(1);
         }
       }),

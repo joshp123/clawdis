@@ -28,6 +28,7 @@ final class NodeAppModel {
     private var voiceWakeSyncTask: Task<Void, Never>?
     @ObservationIgnored private var cameraHUDDismissTask: Task<Void, Never>?
     let voiceWake = VoiceWakeManager()
+    private var lastAutoA2uiURL: String?
 
     var bridgeSession: BridgeSession { self.bridge }
 
@@ -80,7 +81,7 @@ final class NodeAppModel {
         }()
         guard !userAction.isEmpty else { return }
 
-        guard let name = userAction["name"] as? String, !name.isEmpty else { return }
+        guard let name = ClawdisCanvasA2UIAction.extractActionName(userAction) else { return }
         let actionId: String = {
             let id = (userAction["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return id.isEmpty ? UUID().uuidString : id
@@ -102,14 +103,12 @@ final class NodeAppModel {
         let contextJSON = ClawdisCanvasA2UIAction.compactJSON(userAction["context"])
         let sessionKey = "main"
 
-        let message = ClawdisCanvasA2UIAction.formatAgentMessage(
+        let messageContext = ClawdisCanvasA2UIAction.AgentMessageContext(
             actionName: name,
-            sessionKey: sessionKey,
-            surfaceId: surfaceId,
-            sourceComponentId: sourceComponentId,
-            host: host,
-            instanceId: instanceId,
+            session: .init(key: sessionKey, surfaceId: surfaceId),
+            component: .init(id: sourceComponentId, host: host, instanceId: instanceId),
             contextJSON: contextJSON)
+        let message = ClawdisCanvasA2UIAction.formatAgentMessage(messageContext)
 
         let ok: Bool
         var errorText: String?
@@ -147,6 +146,20 @@ final class NodeAppModel {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let base = URL(string: trimmed) else { return nil }
         return base.appendingPathComponent("__clawdis__/a2ui/").absoluteString
+    }
+
+    private func showA2UIOnConnectIfNeeded() async {
+        guard let a2uiUrl = await self.resolveA2UIHostURL() else { return }
+        let current = self.screen.urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if current.isEmpty || current == self.lastAutoA2uiURL {
+            self.screen.navigate(to: a2uiUrl)
+            self.lastAutoA2uiURL = a2uiUrl
+        }
+    }
+
+    private func showLocalCanvasOnDisconnect() {
+        self.lastAutoA2uiURL = nil
+        self.screen.showDefaultCanvas()
     }
 
     func setScenePhase(_ phase: ScenePhase) {
@@ -204,6 +217,7 @@ final class NodeAppModel {
                                 }
                             }
                             await self.startVoiceWakeSync()
+                            await self.showA2UIOnConnectIfNeeded()
                         },
                         onInvoke: { [weak self] req in
                             guard let self else {
@@ -216,6 +230,9 @@ final class NodeAppModel {
                         })
 
                     if Task.isCancelled { break }
+                    await MainActor.run {
+                        self.showLocalCanvasOnDisconnect()
+                    }
                     attempt += 1
                     let sleepSeconds = min(6.0, 0.35 * pow(1.7, Double(attempt)))
                     try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
@@ -226,6 +243,7 @@ final class NodeAppModel {
                         self.bridgeStatusText = "Bridge error: \(error.localizedDescription)"
                         self.bridgeServerName = nil
                         self.bridgeRemoteAddress = nil
+                        self.showLocalCanvasOnDisconnect()
                     }
                     let sleepSeconds = min(8.0, 0.5 * pow(1.7, Double(attempt)))
                     try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
@@ -237,6 +255,7 @@ final class NodeAppModel {
                 self.bridgeServerName = nil
                 self.bridgeRemoteAddress = nil
                 self.connectedBridgeID = nil
+                self.showLocalCanvasOnDisconnect()
             }
         }
     }
@@ -251,6 +270,7 @@ final class NodeAppModel {
         self.bridgeServerName = nil
         self.bridgeRemoteAddress = nil
         self.connectedBridgeID = nil
+        self.showLocalCanvasOnDisconnect()
     }
 
     func setGlobalWakeWords(_ words: [String]) async {
@@ -660,3 +680,43 @@ final class NodeAppModel {
         }
     }
 }
+
+#if DEBUG
+extension NodeAppModel {
+    func _test_handleInvoke(_ req: BridgeInvokeRequest) async -> BridgeInvokeResponse {
+        await self.handleInvoke(req)
+    }
+
+    static func _test_decodeParams<T: Decodable>(_ type: T.Type, from json: String?) throws -> T {
+        try self.decodeParams(type, from: json)
+    }
+
+    static func _test_encodePayload(_ obj: some Encodable) throws -> String {
+        try self.encodePayload(obj)
+    }
+
+    func _test_isCameraEnabled() -> Bool {
+        self.isCameraEnabled()
+    }
+
+    func _test_triggerCameraFlash() {
+        self.triggerCameraFlash()
+    }
+
+    func _test_showCameraHUD(text: String, kind: CameraHUDKind, autoHideSeconds: Double? = nil) {
+        self.showCameraHUD(text: text, kind: kind, autoHideSeconds: autoHideSeconds)
+    }
+
+    func _test_handleCanvasA2UIAction(body: [String: Any]) async {
+        await self.handleCanvasA2UIAction(body: body)
+    }
+
+    func _test_resolveA2UIHostURL() async -> String? {
+        await self.resolveA2UIHostURL()
+    }
+
+    func _test_showLocalCanvasOnDisconnect() {
+        self.showLocalCanvasOnDisconnect()
+    }
+}
+#endif

@@ -1,7 +1,7 @@
 # 🦞 CLAWDIS — Personal AI Assistant
 
 <p align="center">
-  <img src="docs/whatsapp-clawd.jpg" alt="CLAWDIS" width="400">
+  <img src="https://raw.githubusercontent.com/steipete/clawdis/main/docs/whatsapp-clawd.jpg" alt="CLAWDIS" width="400">
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 </p>
 
 **Clawdis** is a *personal AI assistant* you run on your own devices.
-It answers you on the surfaces you already use (WhatsApp, Telegram, WebChat), can speak and listen on macOS/iOS, and can render a live Canvas you control. The Gateway is just the control plane — the product is the assistant.
+It answers you on the surfaces you already use (WhatsApp, Telegram, Discord, WebChat), can speak and listen on macOS/iOS, and can render a live Canvas you control. The Gateway is just the control plane — the product is the assistant.
 
 If you want a private, single-user assistant that feels local, fast, and always-on, this is it.
 
@@ -38,11 +38,12 @@ Your surfaces
 ## What Clawdis does
 
 - **Personal assistant** — one user, one identity, one memory surface.
-- **Multi-surface inbox** — WhatsApp, Telegram, WebChat, macOS, iOS.
+- **Multi-surface inbox** — WhatsApp, Telegram, Discord, WebChat, macOS, iOS.
 - **Voice wake + push-to-talk** — local speech recognition on macOS/iOS.
 - **Canvas** — a live visual workspace you can drive from the agent.
 - **Automation-ready** — browser control, media handling, and tool streaming.
 - **Local-first control plane** — the Gateway owns state, everything else connects.
+- **Group chats** — mention-based by default, `/activation always|mention` per group (owner-only).
 
 ## How it works (short)
 
@@ -66,14 +67,28 @@ pnpm clawdis login
 # Start the gateway
 pnpm clawdis gateway --port 18789 --verbose
 
+# Dev loop (auto-reload on TS changes)
+pnpm gateway:watch
+
 # Send a message
 pnpm clawdis send --to +1234567890 --message "Hello from Clawdis"
 
-# Talk to the assistant (optionally deliver back to WhatsApp/Telegram)
+# Talk to the assistant (optionally deliver back to WhatsApp/Telegram/Discord)
 pnpm clawdis agent --message "Ship checklist" --thinking high
 ```
 
 If you run from source, prefer `pnpm clawdis …` (not global `clawdis`).
+
+## Chat commands
+
+Send these in WhatsApp/Telegram/WebChat (group commands are owner-only):
+
+- `/status` — health + session info (group shows activation mode)
+- `/new` or `/reset` — reset the session
+- `/think <level>` — off|minimal|low|medium|high
+- `/verbose on|off`
+- `/restart` — restart the gateway (owner-only in groups)
+- `/activation mention|always` — group activation toggle (groups only)
 
 ## Architecture
 
@@ -121,7 +136,7 @@ Runbook: `docs/ios/connect.md`.
 
 ## Agent workspace + skills
 
-- Workspace root: `~/clawd` (configurable via `inbound.workspace`).
+- Workspace root: `~/clawd` (configurable via `agent.workspace`).
 - Injected prompt files: `AGENTS.md`, `SOUL.md`, `TOOLS.md`.
 - Skills: `~/clawd/skills/<skill>/SKILL.md`.
 
@@ -131,7 +146,7 @@ Minimal `~/.clawdis/clawdis.json`:
 
 ```json5
 {
-  inbound: {
+  routing: {
     allowFrom: ["+1234567890"]
   }
 }
@@ -140,7 +155,7 @@ Minimal `~/.clawdis/clawdis.json`:
 ### WhatsApp
 
 - Link the device: `pnpm clawdis login` (stores creds in `~/.clawdis/credentials`).
-- Allowlist who can talk to the assistant via `inbound.allowFrom`.
+- Allowlist who can talk to the assistant via `routing.allowFrom`.
 
 ### Telegram
 
@@ -151,6 +166,19 @@ Minimal `~/.clawdis/clawdis.json`:
 {
   telegram: {
     botToken: "123456:ABCDEF"
+  }
+}
+```
+
+### Discord
+
+- Set `DISCORD_BOT_TOKEN` or `discord.token` (env wins).
+- Optional: set `discord.requireMention`, `discord.allowFrom`, or `discord.mediaMaxMb` as needed.
+
+```json5
+{
+  discord: {
+    token: "1234abcd"
   }
 }
 ```
@@ -171,10 +199,21 @@ Browser control (optional):
 
 - [`docs/index.md`](docs/index.md) (overview)
 - [`docs/configuration.md`](docs/configuration.md)
+- [`docs/group-messages.md`](docs/group-messages.md)
 - [`docs/gateway.md`](docs/gateway.md)
 - [`docs/web.md`](docs/web.md)
 - [`docs/discovery.md`](docs/discovery.md)
 - [`docs/agent.md`](docs/agent.md)
+- [`docs/discord.md`](docs/discord.md)
+- Webhooks + external triggers: [`docs/webhook.md`](docs/webhook.md)
+- Gmail hooks (email → wake): [`docs/gmail-pubsub.md`](docs/gmail-pubsub.md)
+
+## Email hooks (Gmail)
+
+```bash
+clawdis hooks gmail setup --account you@gmail.com
+clawdis hooks gmail run
+```
 - [`docs/security.md`](docs/security.md)
 - [`docs/troubleshooting.md`](docs/troubleshooting.md)
 - [`docs/ios/connect.md`](docs/ios/connect.md)

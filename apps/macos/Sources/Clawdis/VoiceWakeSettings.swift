@@ -16,7 +16,7 @@ struct VoiceWakeSettings: View {
     @State private var meterError: String?
     private let meter = MicLevelMonitor()
     @State private var availableLocales: [Locale] = []
-    private let fieldLabelWidth: CGFloat = 120
+    private let fieldLabelWidth: CGFloat = 140
     private let controlWidth: CGFloat = 240
     private let isPreview = ProcessInfo.processInfo.isPreview
 
@@ -338,7 +338,7 @@ struct VoiceWakeSettings: View {
     private var localePicker: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("Language")
+                Text("Recognition language")
                     .font(.callout.weight(.semibold))
                     .frame(width: self.fieldLabelWidth, alignment: .leading)
                 Picker("Language", selection: self.$state.voiceWakeLocaleID) {
@@ -508,6 +508,35 @@ struct VoiceWakeSettings_Previews: PreviewProvider {
     static var previews: some View {
         VoiceWakeSettings(state: .preview)
             .frame(width: SettingsTab.windowWidth, height: SettingsTab.windowHeight)
+    }
+}
+
+@MainActor
+extension VoiceWakeSettings {
+    static func exerciseForTesting() {
+        let state = AppState(preview: true)
+        state.swabbleEnabled = true
+        state.voicePushToTalkEnabled = true
+        state.swabbleTriggerWords = ["Claude", "Hey"]
+
+        let view = VoiceWakeSettings(state: state)
+        view.availableMics = [AudioInputDevice(uid: "mic-1", name: "Built-in")]
+        view.availableLocales = [Locale(identifier: "en_US")]
+        view.meterLevel = 0.42
+        view.meterError = "No input"
+        view.testState = .detected("ok")
+        view.isTesting = true
+
+        _ = view.body
+        _ = view.localePicker
+        _ = view.micPicker
+        _ = view.levelMeter
+        _ = view.triggerTable
+        _ = view.chimeSection
+
+        view.addWord()
+        _ = view.binding(for: 0).wrappedValue
+        view.removeWord(at: 0)
     }
 }
 #endif

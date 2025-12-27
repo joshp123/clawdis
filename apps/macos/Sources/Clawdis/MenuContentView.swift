@@ -8,6 +8,7 @@ import SwiftUI
 struct MenuContent: View {
     @Bindable var state: AppState
     let updater: UpdaterProviding?
+    @Bindable private var updateStatus: UpdateStatus
     private let gatewayManager = GatewayProcessManager.shared
     private let healthStore = HealthStore.shared
     private let heartbeatStore = HeartbeatStore.shared
@@ -16,8 +17,14 @@ struct MenuContent: View {
     @Environment(\.openSettings) private var openSettings
     @State private var availableMics: [AudioInputDevice] = []
     @State private var loadingMics = false
-    @State private var sessionMenu: [SessionRow] = []
     @State private var browserControlEnabled = true
+    @AppStorage(cameraEnabledKey) private var cameraEnabled: Bool = false
+
+    init(state: AppState, updater: UpdaterProviding?) {
+        self._state = Bindable(wrappedValue: state)
+        self.updater = updater
+        self._updateStatus = Bindable(wrappedValue: updater?.updateStatus ?? UpdateStatus.disabled)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -28,28 +35,13 @@ struct MenuContent: View {
                 }
             }
             .disabled(self.state.connectionMode == .unconfigured)
+
             Divider()
             Toggle(isOn: self.heartbeatsBinding) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Send Heartbeats")
+                HStack(spacing: 8) {
+                    Label("Send Heartbeats", systemImage: "waveform.path.ecg")
+                    Spacer(minLength: 0)
                     self.statusLine(label: self.heartbeatStatus.label, color: self.heartbeatStatus.color)
-                }
-            }
-            Toggle(isOn: self.voiceWakeBinding) { Text("Voice Wake") }
-                .disabled(!voiceWakeSupported)
-                .opacity(voiceWakeSupported ? 1 : 0.5)
-            if self.showVoiceWakeMicPicker {
-                self.voiceWakeMicMenu
-            }
-            Button("Open Chat") {
-                Task { @MainActor in
-                    let sessionKey = await WebChatManager.shared.preferredSessionKey()
-                    WebChatManager.shared.show(sessionKey: sessionKey)
-                }
-            }
-            Button("Open Dashboard") {
-                Task { @MainActor in
-                    await self.openDashboard()
                 }
             }
             Toggle(
@@ -59,24 +51,55 @@ struct MenuContent: View {
                         self.browserControlEnabled = enabled
                         ClawdisConfigFile.setBrowserControlEnabled(enabled)
                     })) {
-                Text("Browser Control")
+                Label("Browser Control", systemImage: "globe")
+            }
+            Toggle(isOn: self.$cameraEnabled) {
+                Label("Allow Camera", systemImage: "camera")
             }
             Toggle(isOn: Binding(get: { self.state.canvasEnabled }, set: { self.state.canvasEnabled = $0 })) {
-                Text("Allow Canvas")
+                Label("Allow Canvas", systemImage: "rectangle.and.pencil.and.ellipsis")
             }
             .onChange(of: self.state.canvasEnabled) { _, enabled in
                 if !enabled {
                     CanvasManager.shared.hideAll()
                 }
             }
+            Toggle(isOn: self.voiceWakeBinding) {
+                Label("Voice Wake", systemImage: "mic.fill")
+            }
+                .disabled(!voiceWakeSupported)
+                .opacity(voiceWakeSupported ? 1 : 0.5)
+            if self.showVoiceWakeMicPicker {
+                self.voiceWakeMicMenu
+            }
+            Divider()
+            Button {
+                Task { @MainActor in
+                    await self.openDashboard()
+                }
+            } label: {
+                Label("Open Dashboard", systemImage: "gauge")
+            }
+            Button {
+                Task { @MainActor in
+                    let sessionKey = await WebChatManager.shared.preferredSessionKey()
+                    WebChatManager.shared.show(sessionKey: sessionKey)
+                }
+            } label: {
+                Label("Open Chat", systemImage: "bubble.left.and.bubble.right")
+            }
             if self.state.canvasEnabled {
-                Button(self.state.canvasPanelVisible ? "Close Canvas" : "Open Canvas") {
+                Button {
                     if self.state.canvasPanelVisible {
                         CanvasManager.shared.hideAll()
                     } else {
                         // Don't force a navigation on re-open: preserve the current web view state.
                         _ = try? CanvasManager.shared.show(sessionKey: "main", path: nil)
                     }
+                } label: {
+                    Label(
+                        self.state.canvasPanelVisible ? "Close Canvas" : "Open Canvas",
+                        systemImage: "rectangle.inset.filled.on.rectangle")
                 }
             }
             Divider()
@@ -84,8 +107,8 @@ struct MenuContent: View {
                 .keyboardShortcut(",", modifiers: [.command])
             self.debugMenu
             Button("About Clawdis") { self.open(tab: .about) }
-            if let updater, updater.isAvailable {
-                Button("Check for Updates…") { updater.checkForUpdates(nil) }
+            if let updater, updater.isAvailable, self.updateStatus.isUpdateReady {
+                Button("Update ready, restart now?") { updater.checkForUpdates(nil) }
             }
             Button("Quit") { NSApplication.shared.terminate(nil) }
         }
@@ -93,9 +116,6 @@ struct MenuContent: View {
             if self.state.swabbleEnabled {
                 await self.loadMicrophones(force: true)
             }
-        }
-        .task {
-            await self.reloadSessionMenu()
         }
         .task {
             VoicePushToTalkHotkey.shared.setEnabled(voiceWakeSupported && self.state.voicePushToTalkEnabled)
@@ -123,55 +143,6 @@ struct MenuContent: View {
     private var debugMenu: some View {
         if self.state.debugPaneEnabled {
             Menu("Debug") {
-                Menu {
-                    ForEach(self.sessionMenu) { row in
-                        Menu(row.key) {
-                            Menu("Thinking") {
-                                ForEach(["low", "medium", "high", "default"], id: \.self) { level in
-                                    let normalized = level == "default" ? nil : level
-                                    Button {
-                                        Task {
-                                            try? await DebugActions.updateSession(
-                                                key: row.key,
-                                                thinking: normalized,
-                                                verbose: row.verboseLevel)
-                                            await self.reloadSessionMenu()
-                                        }
-                                    } label: {
-                                        let checkmark = row.thinkingLevel == normalized ? "checkmark" : ""
-                                        Label(level.capitalized, systemImage: checkmark)
-                                    }
-                                }
-                            }
-                            Menu("Verbose") {
-                                ForEach(["on", "off", "default"], id: \.self) { level in
-                                    let normalized = level == "default" ? nil : level
-                                    Button {
-                                        Task {
-                                            try? await DebugActions.updateSession(
-                                                key: row.key,
-                                                thinking: row.thinkingLevel,
-                                                verbose: normalized)
-                                            await self.reloadSessionMenu()
-                                        }
-                                    } label: {
-                                        let checkmark = row.verboseLevel == normalized ? "checkmark" : ""
-                                        Label(level.capitalized, systemImage: checkmark)
-                                    }
-                                }
-                            }
-                            Button {
-                                DebugActions.openSessionStoreInCode()
-                            } label: {
-                                Label("Open Session Log", systemImage: "doc.text")
-                            }
-                        }
-                    }
-                    Divider()
-                } label: {
-                    Label("Sessions", systemImage: "clock.arrow.circlepath")
-                }
-                Divider()
                 Button {
                     DebugActions.openConfigFolder()
                 } label: {
@@ -421,11 +392,6 @@ struct MenuContent: View {
             return "Auto-detect (\(host))"
         }
         return "System default"
-    }
-
-    @MainActor
-    private func reloadSessionMenu() async {
-        self.sessionMenu = await DebugActions.recentSessions()
     }
 
     @MainActor

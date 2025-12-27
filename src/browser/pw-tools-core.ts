@@ -1,3 +1,4 @@
+import type { BrowserFormField } from "./client-actions-core.js";
 import {
   type BrowserConsoleMessage,
   ensurePageState,
@@ -8,6 +9,12 @@ import {
 
 let nextUploadArmId = 0;
 let nextDialogArmId = 0;
+
+function requireRef(value: unknown): string {
+  const ref = typeof value === "string" ? value.trim() : "";
+  if (!ref) throw new Error("ref is required");
+  return ref;
+}
 
 export async function snapshotAiViaPlaywright(opts: {
   cdpPort: number;
@@ -46,15 +53,12 @@ export async function clickViaPlaywright(opts: {
   modifiers?: Array<"Alt" | "Control" | "ControlOrMeta" | "Meta" | "Shift">;
   timeoutMs?: number;
 }): Promise<void> {
-  const ref = String(opts.ref ?? "").trim();
-  if (!ref) throw new Error("ref is required");
-
   const page = await getPageForTargetId({
     cdpPort: opts.cdpPort,
     targetId: opts.targetId,
   });
   ensurePageState(page);
-  const locator = refLocator(page, ref);
+  const locator = refLocator(page, requireRef(opts.ref));
   const timeout = Math.max(
     500,
     Math.min(60_000, Math.floor(opts.timeoutMs ?? 8000)),
@@ -147,12 +151,10 @@ export async function typeViaPlaywright(opts: {
   slowly?: boolean;
   timeoutMs?: number;
 }): Promise<void> {
-  const ref = String(opts.ref ?? "").trim();
-  if (!ref) throw new Error("ref is required");
   const text = String(opts.text ?? "");
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
-  const locator = refLocator(page, ref);
+  const locator = refLocator(page, requireRef(opts.ref));
   const timeout = Math.max(500, Math.min(60_000, opts.timeoutMs ?? 8000));
   if (opts.slowly) {
     await locator.click({ timeout });
@@ -168,18 +170,29 @@ export async function typeViaPlaywright(opts: {
 export async function fillFormViaPlaywright(opts: {
   cdpPort: number;
   targetId?: string;
-  fields: Array<Record<string, unknown>>;
+  fields: BrowserFormField[];
 }): Promise<void> {
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
   for (const field of opts.fields) {
-    const ref = String(field.ref ?? "").trim();
-    const type = String(field.type ?? "").trim();
-    const value = String(field.value ?? "");
+    const ref = field.ref.trim();
+    const type = field.type.trim();
+    const rawValue = field.value;
+    const value =
+      typeof rawValue === "string"
+        ? rawValue
+        : typeof rawValue === "number" || typeof rawValue === "boolean"
+          ? String(rawValue)
+          : "";
     if (!ref || !type) continue;
     const locator = refLocator(page, ref);
     if (type === "checkbox" || type === "radio") {
-      await locator.setChecked(value === "true");
+      const checked =
+        rawValue === true ||
+        rawValue === 1 ||
+        rawValue === "1" ||
+        rawValue === "true";
+      await locator.setChecked(checked);
       continue;
     }
     await locator.fill(value);
@@ -199,18 +212,47 @@ export async function evaluateViaPlaywright(opts: {
   if (opts.ref) {
     const locator = refLocator(page, opts.ref);
     return await locator.evaluate((el, fnBody) => {
-      const runner = new Function(
-        "element",
-        `"use strict"; const fn = ${fnBody}; return fn(element);`,
-      ) as (element: Element) => unknown;
-      return runner(el as Element);
+      const compileRunner = (body: string) => {
+        const inner = `"use strict"; const candidate = ${body}; return typeof candidate === "function" ? candidate(element) : candidate;`;
+        // This intentionally evaluates user-supplied code in the browser context.
+        // oxlint-disable-next-line typescript-eslint/no-implied-eval
+        return new Function("element", inner) as (element: Element) => unknown;
+      };
+      let compiled: unknown;
+      try {
+        compiled = compileRunner(fnBody);
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+              ? err
+              : "invalid expression";
+        throw new Error(`Invalid evaluate function: ${message}`);
+      }
+      return (compiled as (element: Element) => unknown)(el as Element);
     }, fnText);
   }
   return await page.evaluate((fnBody) => {
-    const runner = new Function(
-      `"use strict"; const fn = ${fnBody}; return fn();`,
-    ) as () => unknown;
-    return runner();
+    const compileRunner = (body: string) => {
+      const inner = `"use strict"; const candidate = ${body}; return typeof candidate === "function" ? candidate() : candidate;`;
+      // This intentionally evaluates user-supplied code in the browser context.
+      // oxlint-disable-next-line typescript-eslint/no-implied-eval
+      return new Function(inner) as () => unknown;
+    };
+    let compiled: unknown;
+    try {
+      compiled = compileRunner(fnBody);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "invalid expression";
+      throw new Error(`Invalid evaluate function: ${message}`);
+    }
+    return (compiled as () => unknown)();
   }, fnText);
 }
 

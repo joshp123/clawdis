@@ -71,7 +71,7 @@ For a tailnet-only setup, bind it to the Tailscale IP instead:
 - Set `bridge.bind: "tailnet"` in `~/.clawdis/clawdis.json`.
 - Restart the Gateway (or restart the macOS menubar app via `./scripts/restart-mac.sh` on that machine).
 
-This keeps the bridge reachable only from devices on your tailnet (unless you intentionally expose it some other way).
+This keeps the bridge reachable only from devices on your tailnet (while still listening on loopback for local/SSH port-forwards).
 
 ## What advertises
 
@@ -93,7 +93,7 @@ The Gateway advertises small non-secret hints to make UI flows convenient:
 - `sshPort=<port>` (defaults to 22 when not overridden)
 - `gatewayPort=<port>` (informational; the Gateway WS is typically loopback-only)
 - `bridgePort=<port>` (only when bridge is enabled)
-- `canvasPort=<port>` (only when the canvas host is enabled + reachable; same as `gatewayPort`; serves `/__clawdis__/canvas/`)
+- `canvasPort=<port>` (only when the canvas host is enabled + reachable; default `18793`; serves `/__clawdis__/canvas/`)
 - `cliPath=<path>` (optional; absolute path to a runnable `clawdis` entrypoint or binary)
 - `tailnetDns=<magicdns>` (optional hint; auto-detected from Tailscale when available; may be absent)
 
